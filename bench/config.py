@@ -16,7 +16,7 @@ DEVICE = "cuda"
 MODEL_SIZE = "small"
 
 # Whether to include network latency for cloud adapters
-INCLUDE_NETWORK_LATENCY = True
+INCLUDE_NETWORK_LATENCY = False
 
 # Wav2Vec2 default model id (HF)
 WAV2VEC_MODEL_ID = "facebook/wav2vec2-base-960h"
