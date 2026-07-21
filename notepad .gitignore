@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 
+.ipynb_checkpoints/
+
 results/
 logs/
 vosk-model-small-en-us-0.15.zip
