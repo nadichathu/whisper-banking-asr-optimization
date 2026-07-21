@@ -1,0 +1,42 @@
+file_name,transcript,intent,duration
+atm_limit_01.wav,how much money can I take out at the ATM,atm_limit,3.584
+atm_limit_02.wav,how much money can I withdraw at the ATM,atm_limit,3.157375
+atm_limit_03.wav,what is my limit at the ATM,atm_limit,3.754625
+balance_01.wav,can you see my account balance,balance,2.816
+balance_02.wav,what is my account balance,balance,3.413375
+balance_03.wav,show me my account balance,balance,3.498625
+balance_04.wav,I would like to know what my current account balance shows,balance,3.242625
+balance_05.wav,what's my current balance,balance,3.328
+balance_06.wav,account balance,balance,3.498625
+balance_07.wav,show me my account balance please,balance,2.730625
+balance_08.wav,show me my account balance,balance,3.498625
+balance_09.wav,can I see my account balance please,balance,3.584
+balance_10.wav,show me my current account balance,balance,3.925375
+card_issues_01.wav,why was my card declined,card_issues,3.901
+card_issues_02.wav,I need help activating my scars,card_issues,3.84
+card_issues_03.wav,card not working,card_issues,3.754625
+card_issues_04.wav,my card isn't working,card_issues,3.901
+card_issues_05.wav,trying to figure out why my payment was declined,card_issues,3.754625
+cash_deposit_01.wav,how do I deposit money into my account,cash_deposit,3.413375
+cash_deposit_02.wav,would you like to deposit money into my account,cash_deposit,3.157375
+cash_deposit_03.wav,how do I deposit money into my account,cash_deposit,3.84
+cash_deposit_04.wav,can I make a deposit,cash_deposit,2.389375
+cash_deposit_05.wav,hi I want to deposit money into my savings account,cash_deposit,3.754625
+cash_deposit_06.wav,I'd like to make a deposit,cash_deposit,3.622375
+cash_deposit_07.wav,deposit money into account,cash_deposit,3.754625
+cash_deposit_08.wav,where can I deposit money,cash_deposit,3.925375
+cash_deposit_09.wav,how can I make a deposit,cash_deposit,3.072
+cash_deposit_10.wav,I'd like to deposit money into my account,cash_deposit,3.925375
+latest_transactions_01.wav,tell me about recent transactions on my card,latest_transactions,3.925375
+latest_transactions_02.wav,please show me my latest transactions,latest_transactions,3.072
+latest_transactions_03.wav,show me my recent transactions,latest_transactions,2.986625
+pay_bill_01.wav,epic to make a payment on the bill,pay_bill,3.584
+pay_bill_02.wav,I want to make an online bill payment,pay_bill,2.986625
+pay_bill_03.wav,I would like to make a down payment,pay_bill,3.584
+pay_bill_04.wav,I need to make a payment,pay_bill,2.730625
+pay_bill_05.wav,make a bill payment,pay_bill,3.413375
+pay_bill_06.wav,I'd like to make a payment,pay_bill,3.343625
+pay_bill_07.wav,my bills are due,pay_bill,1.706625
+pay_bill_08.wav,I want to pay off my entire balance,pay_bill,3.669375
+pay_bill_09.wav,I would like to make a payment,pay_bill,2.218625
+pay_bill_10.wav,I'd like to pay my bill,pay_bill,3.328

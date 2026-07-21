@@ -1,0 +1,11 @@
+file,run,latency_ms,transcript,meta,reference,wer
+balance.wav,1,2690.6622999995307,What is my account balance?,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 2690.6558999999106}",What is my account balance?,0.0
+balance.wav,2,3411.762599999747,What is my account balance?,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 3411.7566000004445}",What is my account balance?,0.0
+balance.wav,3,3525.7620000002134,What is my account balance?,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 3525.7566999998744}",What is my account balance?,0.0
+balance.wav,4,3395.019300000058,What is my account balance?,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 3395.0120999998035}",What is my account balance?,0.0
+balance.wav,5,3726.819599999544,What is my account balance?,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 3726.8136000002414}",What is my account balance?,0.0
+check_balance.wav,1,3615.978499999983,Check my account balance.,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 3615.970400000151}",Check my account balance.,0.0
+check_balance.wav,2,3794.5489000003363,Check my account balance.,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 3794.542800000272}",Check my account balance.,0.0
+check_balance.wav,3,3460.4840000001786,Check my account balance.,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 3460.4785000001357}",Check my account balance.,0.0
+check_balance.wav,4,2964.99490000042,Check my account balance.,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 2964.9891999997635}",Check my account balance.,0.0
+check_balance.wav,5,2934.7070999992866,Check my account balance.,"{""model_size"": ""small"", ""device"": ""cpu"", ""latency_ms"": 2934.701000000132}",Check my account balance.,0.0

@@ -1,0 +1,1 @@
+{"model": "whisper_no_context", "n_files": 41, "runs_csv": "results\\whisper_no_context_runs.csv", "per_file_csv": "results\\whisper_no_context_per_file.csv", "env": "{\"platform\": \"Windows-11-10.0.26200-SP0\", \"python\": \"3.13.5\", \"time\": \"2026-07-21 02:41:31\"}", "corpus_wer": 0.053231939163498096}

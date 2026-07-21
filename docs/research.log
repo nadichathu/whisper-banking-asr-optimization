@@ -1,0 +1,229 @@
+# Research Log
+
+## Log format
+1. Objective (What am I trying to learn?)
+2. Configuration (Under what conditions?)
+3. Results (What numbers did I get?)
+4. Interpretation (What do the numbers mean?)
+5. Next Experiment (What will I do next?)
+
+-----------------------------------------------------------------------
+
+## 2026-03-15
+
+Work Session: 3 hours
+
+Objective
+
+Establish a reproducible benchmarking framework for evaluating Automatic Speech Recognition (ASR) models on short banking voice commands.
+
+---
+
+Tasks Completed
+
+* Created research project structure:
+
+  * results/
+  * profiling/
+  * experiments/
+  * docs/
+* Implemented benchmarking framework
+* Integrated ASR model evaluation pipeline
+* Defined latency measurement methodology
+* Prepared initial banking voice command dataset
+* Executed baseline benchmarking experiments
+
+---
+
+Configuration
+
+* Task: Speech-to-Text (ASR)
+* Domain: Banking Voice Commands
+* Device: CPU
+* Audio Duration: ≤ 4 seconds
+* Warmup Runs: 2
+* Measured Runs: 5
+* Metrics:
+
+  * Inference Latency
+  * Word Error Rate (WER)
+
+---
+
+Results Summary
+
+Baseline benchmarking framework successfully established.
+
+Measured outputs:
+
+* Mean latency
+* P50 latency
+* P95 latency
+* Word Error Rate (WER)
+
+Results were successfully generated and stored for subsequent comparative analysis.
+
+---
+
+Key Observation
+
+The benchmarking framework was able to consistently measure latency and transcription performance across multiple audio samples.
+
+The framework is suitable for evaluating and comparing different ASR models under identical conditions.
+
+---
+
+Interpretation
+
+A reproducible evaluation framework is essential before attempting any optimization.
+
+This experiment establishes the baseline methodology that will be used throughout the research to compare model performance and quantify optimization improvements.
+
+---
+
+Research Contribution
+
+Developed a reproducible benchmarking framework for evaluating ASR models on short banking voice commands.
+
+This framework serves as the foundation for model comparison, selection, and optimization experiments.
+
+---
+
+Next Experiment
+
+Experiment 2: Whisper Profiling
+
+Objectives:
+
+* Profile Whisper inference pipeline
+* Measure stage-level latency
+* Identify primary performance bottlenecks
+
+Evaluation Targets:
+
+* Audio Loading
+* Preprocessing
+* Encoder
+* Decoder
+
+Expected Outcome:
+
+Identification of the dominant latency contributor within the Whisper inference pipeline.
+
+-----------------------------------------------------------------------
+
+## 2026-03-16
+
+Work Session: 4 hours
+
+Objective
+
+Identify the primary latency bottleneck within the Whisper inference pipeline for short banking voice commands.
+
+---
+
+Tasks Completed
+
+* Updated profiling framework to use the MINDS-14 banking subset
+* Implemented stage-level latency measurements in profiling/profile_whisper.py
+* Measured execution time for:
+
+  * audio loading
+  * audio padding/trimming
+  * mel spectrogram generation
+  * encoder forward pass
+  * decoder execution
+* Executed profiling experiments on the banking command dataset
+* Generated baseline profiling results
+
+---
+
+Configuration
+
+* Dataset: MINDS-14 Banking Subset
+* Number of Files: 41
+* Audio Duration: ≤ 4 seconds
+* Intents:
+
+  * atm_limit
+  * balance
+  * card_issues
+  * cash_deposit
+  * latest_transactions
+  * pay_bill
+* Model: Whisper Small
+* Device: CPU
+* Decoding Method: whisper.decode()
+* Language: English
+
+---
+
+Results Summary
+
+Typical latency ranges observed:
+
+* Audio Loading: ~90–140 ms
+* Pad/Trim: ~1 ms
+* Mel Spectrogram: ~4–12 ms
+* Encoder: ~1300–1450 ms
+* Decoder: ~1700–2100 ms
+* Total Inference Time: ~3100–3600 ms
+
+---
+
+Key Observation
+
+The decoder stage consistently required more processing time than any other component.
+
+Approximate contribution:
+
+* Decoder: 55–60%
+* Encoder: 35–40%
+* Preprocessing: <5%
+
+---
+
+Interpretation
+
+The Whisper decoder is the primary latency bottleneck when processing short banking voice commands.
+
+Although encoder execution contributes significantly to overall latency, decoder execution remains the dominant source of delay and represents the most promising optimization target.
+
+---
+
+Research Contribution
+
+This experiment identified the principal latency bottleneck within the Whisper inference pipeline.
+
+The findings provide a data-driven basis for focusing subsequent optimization efforts on decoder performance rather than preprocessing or feature extraction stages.
+
+---
+
+Next Experiment
+
+Experiment 3: Greedy Decoding Evaluation
+
+Objectives:
+
+* Reduce decoder computation overhead
+* Evaluate latency improvements
+* Measure impact on transcription accuracy
+
+Planned Modifications:
+
+* beam_size = 1
+* best_of = 1
+
+Evaluation Metrics:
+
+* Mean Latency
+* P50 Latency
+* P95 Latency
+* Word Error Rate (WER)
+
+Expected Outcome:
+
+Reduced inference latency with minimal degradation in transcription accuracy for short banking voice commands.
+
+-----------------------------------------------------------------------
+

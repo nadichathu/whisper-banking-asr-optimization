@@ -1,0 +1,1 @@
+{"n_files": 2, "runs_csv": "results\\bench_runs.csv", "per_file_csv": "results\\bench_per_file.csv", "env": "{\"platform\": \"Windows-11-10.0.26100-SP0\", \"python\": \"3.13.5\", \"time\": \"2026-04-01 17:42:35\"}", "corpus_wer": 0.0}

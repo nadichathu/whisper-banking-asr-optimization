@@ -1,0 +1,11 @@
+file,reference
+balance.wav,What is my account balance?
+check_balance.wav,Check my account balance.
+credit_card_due.wav,When is my credit card payment due?
+loan_status.wav,What is my loan status?
+open_statement.wav,Open my bank statement.
+recent_payments.wav,Show my recent payments.
+savings_balance.wav,What is my savings account balance?
+send_money.wav,Send money to John.
+transactions.wav,Show my recent transactions.
+transfer.wav,Transfer money to my savings account
