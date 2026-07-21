@@ -25,3 +25,5 @@ soundfile
 librosa
 
 openpyxl
+
+silero_vad
