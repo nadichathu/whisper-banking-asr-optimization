@@ -4,17 +4,28 @@ import whisper
 
 
 class WhisperFP16Adapter:
-    def __init__(self):
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.device = "cuda"
+        self.model = None
+        self.name = "whisper_fp16"
+
+    def load(self):
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "CUDA GPU is required for the Whisper FP16 experiment."
             )
 
-        self.device = "cuda"
-        self.model = whisper.load_model("small", device=self.device)
-        self.name = "whisper_fp16"
+        model_size = self.config.get("model_size", "small")
+        self.model = whisper.load_model(
+            model_size,
+            device=self.device,
+        )
 
     def transcribe(self, audio_path):
+        if self.model is None:
+            raise RuntimeError("Model is not loaded. Call load() first.")
+
         torch.cuda.synchronize()
         start = time.perf_counter()
 
