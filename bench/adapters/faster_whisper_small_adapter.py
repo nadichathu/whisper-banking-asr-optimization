@@ -1,66 +1,48 @@
-import time
-from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
-from faster_whisper import WhisperModel
+from .faster_whisper_adapter import FasterWhisperAdapter
 
 
-class FasterWhisperSmallAdapter:
-    def __init__(self) -> None:
-        self.name = "faster_whisper_small"
-        self.model_name = "small"
-        self.device = "cuda"
-        self.compute_type = "float16"
+class FasterWhisperSmallAdapter(FasterWhisperAdapter):
+    """Faster-Whisper adapter fixed to the Whisper Small model.
 
-        self.model = WhisperModel(
-            self.model_name,
-            device=self.device,
-            compute_type=self.compute_type,
-            num_workers=1,
-        )
+    This adapter reuses the complete FasterWhisperAdapter implementation
+    rather than duplicating its loading, transcription, timing, metadata,
+    validation, and cleanup logic.
 
-    def transcribe(
+    The only model-specific change is:
+
+        model_size="small"
+
+    This design prevents the Small and Medium adapters from silently drifting
+    apart when decoding parameters or benchmark methodology are updated.
+    """
+
+    MODEL_SIZE = "small"
+
+    def __init__(
         self,
-        audio_path: str | Path,
-    ) -> dict[str, Any]:
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        resolved_config = dict(config or {})
 
-        start = time.perf_counter()
-
-        segments, info = self.model.transcribe(
-            str(audio_path),
-            language="en",
-            task="transcribe",
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            condition_on_previous_text=False,
-            without_timestamps=True,
-            word_timestamps=False,
-            vad_filter=False,
+        requested_model_size = resolved_config.get(
+            "model_size",
+            self.MODEL_SIZE,
         )
 
-        segment_list = list(segments)
+        if str(requested_model_size).lower() != self.MODEL_SIZE:
+            raise ValueError(
+                "FasterWhisperSmallAdapter only supports "
+                "model_size='small'. "
+                f"Received model_size='{requested_model_size}'. "
+                "Use FasterWhisperMediumAdapter for the medium model "
+                "or FasterWhisperAdapter for a configurable model size."
+            )
 
-        latency_ms = (
-            time.perf_counter() - start
-        ) * 1000
+        resolved_config["model_size"] = self.MODEL_SIZE
 
-        text = " ".join(
-            segment.text.strip()
-            for segment in segment_list
-            if segment.text.strip()
-        ).strip()
+        super().__init__(resolved_config)
 
-        return {
-            "text": text,
-            "latency_ms": latency_ms,
-            "meta": {
-                "implementation": "faster-whisper",
-                "backend": "CTranslate2",
-                "model_size": self.model_name,
-                "device": self.device,
-                "compute_type": self.compute_type,
-                "segment_count": len(segment_list),
-                "audio_duration_s": float(info.duration),
-            },
-        }
+        self.name = "faster_whisper_small"
+        self.model_size = self.MODEL_SIZE

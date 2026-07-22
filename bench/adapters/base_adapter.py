@@ -1,34 +1,71 @@
+from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict
 
-class BaseAdapter:
-    """Base adapter interface for ASR backends.
 
-    Implementations should override load(), transcribe(), and close().
-    transcribe must be synchronous and return a dict with at least:
-      {"text": str, "meta": { ... }}
+class BaseAdapter(ABC):
+    """Base interface for all ASR benchmark adapters.
+
+    Every adapter must implement:
+
+        __init__(config=None)
+        load()
+        transcribe(audio_path)
+        close()
+
+    transcribe() must return:
+
+        {
+            "text": str,
+            "latency_ms": float,
+            "meta": dict,
+        }
     """
 
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or {}
+        self.name = self.__class__.__name__
 
-    def load(self):
-        """Load model resources. May be expensive."""
-        raise NotImplementedError()
+    @abstractmethod
+    def load(self) -> Any:
+        """Load model resources.
 
-    def transcribe(self, audio_path: str) -> Dict[str, Any]:
-        """Synchronously transcribe the given audio file.
-
-        Returns: {"text": str, "meta": {...}}
+        This method may download model files and allocate CPU or GPU memory.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def profile(self, audio_path: str) -> Dict[str, float]:
-        """Optional: return per-stage timings as a dict.
+    @abstractmethod
+    def transcribe(
+        self,
+        audio_path: str | Path,
+    ) -> Dict[str, Any]:
+        """Synchronously transcribe an audio file.
 
-        Raise NotImplementedError if profiling not supported.
+        Returns:
+            {
+                "text": str,
+                "latency_ms": float,
+                "meta": dict,
+            }
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def close(self):
-        """Free resources if necessary."""
+    def profile(
+        self,
+        audio_path: str | Path,
+    ) -> Dict[str, Any]:
+        """Return optional stage-level timing information.
+
+        Adapters that do not support profiling may keep this default
+        implementation.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support profiling."
+        )
+
+    def close(self) -> None:
+        """Release model resources.
+
+        Adapters may override this method when explicit cleanup is required.
+        """
         return None

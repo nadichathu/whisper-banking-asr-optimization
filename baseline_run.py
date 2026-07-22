@@ -1,98 +1,268 @@
-import time
 import pathlib
 import statistics as stats
+import time
+
 import pandas as pd
+import torch
 import whisper
 
-# ===== CONFIG =====
+
+# =========================
+# CONFIGURATION
+# =========================
 
 AUDIO_DIR = pathlib.Path("audio_samples")
-RESULT_PATH = pathlib.Path("results/baseline_results.csv")
+
+RUN_RESULTS_PATH = pathlib.Path(
+    "results/baseline_runs.csv"
+)
+
+SUMMARY_RESULTS_PATH = pathlib.Path(
+    "results/baseline_results.csv"
+)
 
 MODEL_SIZE = "small"
-DEVICE = "cpu"
+
+REQUESTED_DEVICE = "cpu"
 
 N_WARMUP = 2
 N_RUNS = 5
 
-FP16 = False
+LANGUAGE = "en"
 
-# ===================
-
-
-def percentile(values, p):
-    values = sorted(values)
-    k = (len(values) - 1) * (p / 100)
-    f = int(k)
-    c = min(f + 1, len(values) - 1)
-    if f == c:
-        return values[f]
-    return values[f] + (values[c] - values[f]) * (k - f)
+# =========================
 
 
-def main():
+def resolve_device(requested_device: str) -> str:
+    requested_device = requested_device.lower()
 
-    print("Loading Whisper model...")
-    model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+    if requested_device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            print(
+                "CUDA was requested but is unavailable. "
+                "Falling back to CPU."
+            )
+            return "cpu"
 
-    audio_files = sorted(AUDIO_DIR.glob("*.wav"))
+        return requested_device
+
+    return "cpu"
+
+
+def synchronize_cuda(device: str) -> None:
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def main() -> None:
+    device = resolve_device(REQUESTED_DEVICE)
+    use_fp16 = device.startswith("cuda")
+
+    print(
+        f"Loading Whisper {MODEL_SIZE} "
+        f"on {device} using "
+        f"{'FP16' if use_fp16 else 'FP32'}..."
+    )
+
+    model = whisper.load_model(
+        MODEL_SIZE,
+        device=device,
+    )
+
+    model.eval()
+
+    audio_files = sorted(
+        AUDIO_DIR.glob("*.wav")
+    )
 
     if not audio_files:
-        raise SystemExit("No WAV files found in audio_samples")
+        raise SystemExit(
+            f"No WAV files found in: {AUDIO_DIR.resolve()}"
+        )
 
-    rows = []
+    run_rows = []
+    summary_rows = []
 
-    for audio in audio_files:
+    for audio_path in audio_files:
+        print(f"\nProcessing: {audio_path.name}")
 
-        print(f"\nProcessing {audio.name}")
+        # Load audio once only to obtain its duration.
+        audio_data = whisper.load_audio(
+            str(audio_path)
+        )
+
+        audio_duration_s = (
+            len(audio_data) / whisper.audio.SAMPLE_RATE
+        )
+
+        print(
+            f"Audio duration: {audio_duration_s:.3f} seconds"
+        )
+
+        print(
+            f"Running {N_WARMUP} warm-up transcription(s)..."
+        )
+
+        for warmup_number in range(
+            1,
+            N_WARMUP + 1,
+        ):
+            model.transcribe(
+                str(audio_path),
+                task="transcribe",
+                language=LANGUAGE,
+                fp16=use_fp16,
+            )
+
+            synchronize_cuda(device)
+
+            print(
+                f"Warm-up {warmup_number}/{N_WARMUP} complete"
+            )
 
         latencies = []
+        transcriptions = []
 
-        # warmup
-        for _ in range(N_WARMUP):
-            model.transcribe(
-                str(audio),
-                fp16=(FP16 and DEVICE == "cuda"),
-                task="transcribe"
-            )
+        print(
+            f"Running {N_RUNS} measured transcription(s)..."
+        )
 
-        # measured runs
-        for run in range(N_RUNS):
+        for run_number in range(
+            1,
+            N_RUNS + 1,
+        ):
+            synchronize_cuda(device)
 
-            t0 = time.perf_counter()
+            start = time.perf_counter()
 
             result = model.transcribe(
-                str(audio),
-                fp16=(FP16 and DEVICE == "cuda"),
-                task="transcribe"
+                str(audio_path),
+                task="transcribe",
+                language=LANGUAGE,
+                fp16=use_fp16,
             )
 
-            t1 = time.perf_counter()
+            synchronize_cuda(device)
 
-            latency = (t1 - t0) * 1000
-            latencies.append(latency)
+            latency_ms = (
+                time.perf_counter() - start
+            ) * 1000
 
-            print(f"run {run+1}: {latency:.2f} ms")
+            text = result.get(
+                "text",
+                "",
+            ).strip()
 
-        row = {
-            "file": audio.name,
-            "mean": stats.mean(latencies),
-            "p50": percentile(latencies, 50),
-            "p95": percentile(latencies, 95),
-            "p99": percentile(latencies, 99),
-            "best": min(latencies),
-            "worst": max(latencies)
-        }
+            real_time_factor = (
+                latency_ms / 1000
+            ) / audio_duration_s
 
-        rows.append(row)
+            latencies.append(latency_ms)
+            transcriptions.append(text)
 
-    df = pd.DataFrame(rows)
+            run_rows.append(
+                {
+                    "file": audio_path.name,
+                    "run": run_number,
+                    "model_size": MODEL_SIZE,
+                    "device": device,
+                    "precision": (
+                        "fp16"
+                        if use_fp16
+                        else "fp32"
+                    ),
+                    "language": LANGUAGE,
+                    "audio_duration_s": audio_duration_s,
+                    "latency_ms": latency_ms,
+                    "real_time_factor": real_time_factor,
+                    "text": text,
+                }
+            )
 
-    RESULT_PATH.parent.mkdir(exist_ok=True)
-    df.to_csv(RESULT_PATH, index=False)
+            print(
+                f"Run {run_number}: "
+                f"{latency_ms:.2f} ms | "
+                f"RTF: {real_time_factor:.4f}"
+            )
 
-    print("\nBaseline results saved to:", RESULT_PATH)
-    print(df)
+        latency_series = pd.Series(
+            latencies,
+            dtype="float64",
+        )
+
+        representative_text = (
+            stats.mode(transcriptions)
+            if transcriptions
+            else ""
+        )
+
+        summary_rows.append(
+            {
+                "file": audio_path.name,
+                "model_size": MODEL_SIZE,
+                "device": device,
+                "precision": (
+                    "fp16"
+                    if use_fp16
+                    else "fp32"
+                ),
+                "language": LANGUAGE,
+                "audio_duration_s": audio_duration_s,
+                "warmup_runs": N_WARMUP,
+                "measured_runs": N_RUNS,
+                "mean_ms": stats.mean(latencies),
+                "median_ms": stats.median(latencies),
+                "p50_ms": latency_series.quantile(0.50),
+                "p95_ms": latency_series.quantile(0.95),
+                "p99_ms": latency_series.quantile(0.99),
+                "std_ms": (
+                    stats.stdev(latencies)
+                    if len(latencies) > 1
+                    else 0.0
+                ),
+                "best_ms": min(latencies),
+                "worst_ms": max(latencies),
+                "mean_rtf": (
+                    stats.mean(latencies) / 1000
+                ) / audio_duration_s,
+                "text": representative_text,
+            }
+        )
+
+    run_df = pd.DataFrame(run_rows)
+    summary_df = pd.DataFrame(summary_rows)
+
+    RUN_RESULTS_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    run_df.to_csv(
+        RUN_RESULTS_PATH,
+        index=False,
+    )
+
+    summary_df.to_csv(
+        SUMMARY_RESULTS_PATH,
+        index=False,
+    )
+
+    print(
+        "\nIndividual runs saved to:",
+        RUN_RESULTS_PATH,
+    )
+
+    print(
+        "Summary results saved to:",
+        SUMMARY_RESULTS_PATH,
+    )
+
+    print("\nSummary:")
+    print(
+        summary_df.to_string(
+            index=False
+        )
+    )
 
 
 if __name__ == "__main__":

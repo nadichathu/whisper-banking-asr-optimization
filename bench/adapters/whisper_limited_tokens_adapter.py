@@ -1,112 +1,224 @@
+import gc
 import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
 
 import torch
 import whisper
 
+from .base_adapter import BaseAdapter
+from bench.config import DEVICE, MODEL_SIZE
 
-class WhisperLimitedTokensAdapter:
+
+class WhisperLimitedTokensAdapter(BaseAdapter):
+    """OpenAI Whisper with a limited decoder output length.
+
+    Experimental change relative to the FP32 Whisper baseline:
+
+        sample_len=max_tokens
+
+    The adapter deliberately uses Whisper's high-level ``transcribe()``
+    method so that the timing boundary, audio loading, preprocessing,
+    segmentation, timestamp behaviour, temperature fallback, and context
+    propagation remain aligned with the baseline.
+
+    Only the maximum number of tokens generated during each decoding
+    window is changed.
     """
-    OpenAI Whisper adapter that limits the maximum number of tokens generated
-    during decoding.
 
-    This adapter is intended for short banking voice commands, where long
-    transcription outputs are unnecessary.
-    """
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(config)
 
-    def __init__(self, config=None):
         self.config = config or {}
-
-        self.device = self.config.get(
-            "device",
-            "cuda" if torch.cuda.is_available() else "cpu",
-        )
-
-        self.model_size = self.config.get("model_size", "small")
-        self.max_tokens = int(self.config.get("max_tokens", 32))
-
-        self.model = None
         self.name = "whisper_limited_tokens"
 
+        self.model_size = self.config.get(
+            "model_size",
+            MODEL_SIZE,
+        )
+
+        self.max_tokens = int(
+            self.config.get(
+                "max_tokens",
+                32,
+            )
+        )
+
+        if self.max_tokens <= 0:
+            raise ValueError(
+                "max_tokens must be greater than zero."
+            )
+
+        requested_device = str(
+            self.config.get(
+                "device",
+                DEVICE,
+            )
+        ).lower()
+
+        if requested_device.startswith("cuda"):
+            if torch.cuda.is_available():
+                self.device = requested_device
+            else:
+                print(
+                    "CUDA was requested but is unavailable. "
+                    "Falling back to CPU."
+                )
+                self.device = "cpu"
+        else:
+            self.device = "cpu"
+
+        self._model = None
+
     def load(self):
-        """
-        Load the Whisper model onto the configured device.
-        """
+        """Load the Whisper model."""
 
-        if self.device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(
-                "CUDA was requested, but no CUDA-compatible GPU is available."
+        if self._model is None:
+            print(
+                f"Loading Whisper {self.model_size} "
+                f"limited-token adapter on {self.device}"
             )
 
-        self.model = whisper.load_model(
-            self.model_size,
-            device=self.device,
-        )
-
-    def transcribe(self, audio_path):
-        """
-        Transcribe one audio file using limited-token decoding.
-        """
-
-        if self.model is None:
-            raise RuntimeError(
-                "Model is not loaded. Call load() before transcribing."
+            self._model = whisper.load_model(
+                self.model_size,
+                device=self.device,
             )
 
-        # Load and prepare audio using Whisper's standard preprocessing.
-        audio = whisper.load_audio(str(audio_path))
-        audio = whisper.pad_or_trim(audio)
+            self._model.eval()
 
-        mel = whisper.log_mel_spectrogram(
-            audio,
-            n_mels=self.model.dims.n_mels,
-        ).to(self.device)
+        return self._model
 
-        use_fp16 = self.device == "cuda"
+    def transcribe(
+        self,
+        audio_path: Union[str, Path],
+    ) -> Dict[str, Any]:
+        """Transcribe an audio file with limited decoder tokens."""
 
-        decoding_options = whisper.DecodingOptions(
-            task="transcribe",
-            language="en",
-            fp16=use_fp16,
-            temperature=0.0,
-            without_timestamps=True,
-            sample_len=self.max_tokens,
-        )
+        if self._model is None:
+            raise RuntimeError(
+                "Whisper model is not loaded. "
+                "Call load() before transcribe()."
+            )
 
-        if self.device == "cuda":
+        audio_path = Path(audio_path)
+
+        if not audio_path.exists():
+            raise FileNotFoundError(
+                f"Audio file was not found: {audio_path}"
+            )
+
+        if not audio_path.is_file():
+            raise ValueError(
+                f"Audio path is not a file: {audio_path}"
+            )
+
+        if self.device.startswith("cuda"):
             torch.cuda.synchronize()
 
         start_time = time.perf_counter()
 
-        with torch.inference_mode():
-            result = whisper.decode(
-                self.model,
-                mel,
-                decoding_options,
-            )
+        result = self._model.transcribe(
+            str(audio_path),
+            task="transcribe",
+            language="en",
 
-        if self.device == "cuda":
+            # Keep precision identical to the corrected
+            # FP32 Whisper baseline.
+            fp16=False,
+
+            # Experimental variable:
+            # limit generated tokens per decoding window.
+            sample_len=self.max_tokens,
+
+            # Do not specify:
+            # - temperature
+            # - condition_on_previous_text
+            # - without_timestamps
+            #
+            # This preserves Whisper's baseline defaults.
+        )
+
+        if self.device.startswith("cuda"):
             torch.cuda.synchronize()
 
-        latency_ms = (time.perf_counter() - start_time) * 1000
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        text = str(
+            result.get(
+                "text",
+                "",
+            )
+        ).strip()
+
+        segments = result.get(
+            "segments",
+            [],
+        )
+
+        generated_token_count = 0
+
+        for segment in segments:
+            tokens = segment.get(
+                "tokens",
+                [],
+            )
+
+            if tokens is not None:
+                generated_token_count += len(tokens)
 
         return {
-            "text": result.text.strip(),
+            "text": text,
             "latency_ms": latency_ms,
             "meta": {
-                "model": self.model_size,
+                "implementation": "openai-whisper",
+                "backend": "whisper",
+                "optimization": "limited_decoder_tokens",
+                "experimental_change": (
+                    f"sample_len={self.max_tokens}"
+                ),
+                "model_size": self.model_size,
                 "device": self.device,
-                "precision": "fp16" if use_fp16 else "fp32",
-                "max_tokens": self.max_tokens,
-                "decoding": "limited_tokens",
+                "precision": "fp32",
+                "language": "en",
+                "decoding": "default_transcribe_limited_tokens",
+                "max_tokens_per_decode_window": self.max_tokens,
+                "generated_token_count": generated_token_count,
+                "segment_count": len(segments),
+
+                # These remain at Whisper baseline behaviour.
+                "timestamps_disabled": False,
+                "condition_on_previous_text": True,
+                "temperature_fallback_enabled": True,
+
+                "latency_type": "end_to_end",
+                "latency_includes": [
+                    "audio_loading",
+                    "audio_decoding",
+                    "audio_resampling",
+                    "padding",
+                    "mel_spectrogram",
+                    "segmentation",
+                    "encoder",
+                    "limited_token_decoder",
+                    "timestamp_processing",
+                    "text_generation",
+                ],
             },
         }
 
-    def close(self):
-        """
-        Release the model and clear unused GPU memory.
-        """
+    def close(self) -> None:
+        """Release Whisper model resources."""
 
-        self.model = None
+        used_cuda = self.device.startswith("cuda")
 
-        if torch.cuda.is_available():
+        self._model = None
+
+        gc.collect()
+
+        if used_cuda:
             torch.cuda.empty_cache()
