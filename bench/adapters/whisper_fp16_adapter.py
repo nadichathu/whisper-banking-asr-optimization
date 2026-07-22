@@ -1,4 +1,5 @@
 import time
+
 import torch
 import whisper
 
@@ -17,6 +18,7 @@ class WhisperFP16Adapter:
             )
 
         model_size = self.config.get("model_size", "small")
+
         self.model = whisper.load_model(
             model_size,
             device=self.device,
@@ -24,10 +26,12 @@ class WhisperFP16Adapter:
 
     def transcribe(self, audio_path):
         if self.model is None:
-            raise RuntimeError("Model is not loaded. Call load() first.")
+            raise RuntimeError(
+                "Model is not loaded. Call load() before transcribing."
+            )
 
         torch.cuda.synchronize()
-        start = time.perf_counter()
+        start_time = time.perf_counter()
 
         result = self.model.transcribe(
             str(audio_path),
@@ -39,13 +43,20 @@ class WhisperFP16Adapter:
         )
 
         torch.cuda.synchronize()
-        latency_ms = (time.perf_counter() - start) * 1000
+        latency_ms = (time.perf_counter() - start_time) * 1000
 
         return {
             "text": result["text"].strip(),
             "latency_ms": latency_ms,
             "meta": {
+                "model": self.config.get("model_size", "small"),
                 "device": self.device,
                 "precision": "fp16",
             },
         }
+
+    def close(self):
+        self.model = None
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
