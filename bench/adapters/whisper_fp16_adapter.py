@@ -3,37 +3,30 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-import numpy as np
 import torch
 import whisper
-from silero_vad import (
-    collect_chunks,
-    get_speech_timestamps,
-    load_silero_vad,
-)
 
 from .base_adapter import BaseAdapter
 from bench.config import DEVICE, MODEL_SIZE
 
 
-class WhisperVadAdapter(BaseAdapter):
-    """OpenAI Whisper with Silero VAD silence trimming.
+class WhisperFP16Adapter(BaseAdapter):
+    """OpenAI Whisper FP16 adapter for CUDA inference.
 
-    Experimental change relative to the FP32 Whisper baseline:
+    This adapter is intended to isolate the effect of FP16 precision
+    relative to the FP32 Whisper baseline.
 
-        Silero VAD removes detected non-speech regions before Whisper
-        transcription.
+    A methodologically valid comparison requires:
 
-    The end-to-end latency measurement includes:
+    - the same CUDA device
+    - the same Whisper model size
+    - the same audio files
+    - the same transcription settings
+    - the same latency boundary
 
-        - Whisper-compatible audio loading and resampling
-        - Silero VAD speech detection
-        - Speech-chunk collection
-        - Waveform conversion
-        - Whisper transcription
-        - Final text extraction
-
-    Model-loading time is intentionally excluded from benchmark latency.
+    FP16 inference is not supported as a valid CPU benchmark condition.
+    Therefore, this adapter rejects CPU instead of silently falling back
+    to FP32 or changing hardware.
     """
 
     def __init__(
@@ -43,7 +36,7 @@ class WhisperVadAdapter(BaseAdapter):
         super().__init__(config)
 
         self.config = config or {}
-        self.name = "whisper_vad"
+        self.name = "whisper_fp16"
 
         self.model_size = self.config.get(
             "model_size",
@@ -55,91 +48,61 @@ class WhisperVadAdapter(BaseAdapter):
                 "device",
                 DEVICE,
             )
-        ).lower()
+        ).lower().strip()
 
-        if requested_device.startswith("cuda"):
-            if torch.cuda.is_available():
-                self.device = requested_device
-            else:
-                print(
-                    "CUDA was requested but is unavailable. "
-                    "Falling back to CPU."
+        if not requested_device.startswith("cuda"):
+            raise ValueError(
+                "WhisperFP16Adapter requires a CUDA device. "
+                f"Received device='{requested_device}'. "
+                "Run with '--device cuda' or '--device cuda:0'."
+            )
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "WhisperFP16Adapter requires CUDA, but CUDA is not "
+                "available in the current environment."
+            )
+
+        try:
+            torch.device(requested_device)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Invalid CUDA device: '{requested_device}'."
+            ) from exc
+
+        if ":" in requested_device:
+            try:
+                device_index = int(
+                    requested_device.split(":", maxsplit=1)[1]
                 )
-                self.device = "cpu"
-        else:
-            self.device = "cpu"
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid CUDA device index in "
+                    f"'{requested_device}'."
+                ) from exc
 
-        self.sample_rate = int(
-            self.config.get(
-                "sample_rate",
-                16000,
-            )
-        )
+            if device_index < 0:
+                raise ValueError(
+                    "CUDA device index cannot be negative."
+                )
 
-        self.vad_threshold = float(
-            self.config.get(
-                "vad_threshold",
-                0.5,
-            )
-        )
+            if device_index >= torch.cuda.device_count():
+                raise ValueError(
+                    f"CUDA device '{requested_device}' does not exist. "
+                    f"Available CUDA device count: "
+                    f"{torch.cuda.device_count()}."
+                )
 
-        self.min_speech_duration_ms = int(
-            self.config.get(
-                "min_speech_duration_ms",
-                100,
-            )
-        )
-
-        self.min_silence_duration_ms = int(
-            self.config.get(
-                "min_silence_duration_ms",
-                100,
-            )
-        )
-
-        self.speech_pad_ms = int(
-            self.config.get(
-                "speech_pad_ms",
-                100,
-            )
-        )
-
-        if self.sample_rate not in {8000, 16000}:
-            raise ValueError(
-                "Silero VAD supports sample rates of "
-                "8000 Hz or 16000 Hz."
-            )
-
-        if not 0.0 <= self.vad_threshold <= 1.0:
-            raise ValueError(
-                "vad_threshold must be between 0.0 and 1.0."
-            )
-
-        if self.min_speech_duration_ms < 0:
-            raise ValueError(
-                "min_speech_duration_ms cannot be negative."
-            )
-
-        if self.min_silence_duration_ms < 0:
-            raise ValueError(
-                "min_silence_duration_ms cannot be negative."
-            )
-
-        if self.speech_pad_ms < 0:
-            raise ValueError(
-                "speech_pad_ms cannot be negative."
-            )
-
+        self.device = requested_device
         self._model = None
-        self._vad_model = None
 
     def load(self):
-        """Load Whisper and Silero VAD models."""
+        """Load the Whisper model on CUDA."""
 
         if self._model is None:
             print(
                 f"Loading Whisper {self.model_size} "
-                f"VAD adapter on {self.device}"
+                f"FP16 on {self.device}"
             )
 
             self._model = whisper.load_model(
@@ -149,29 +112,17 @@ class WhisperVadAdapter(BaseAdapter):
 
             self._model.eval()
 
-        if self._vad_model is None:
-            print(
-                "Loading Silero VAD on CPU"
-            )
-
-            # Keep VAD on CPU so that it does not consume
-            # Whisper's GPU memory.
-            self._vad_model = load_silero_vad()
-
-            if hasattr(self._vad_model, "eval"):
-                self._vad_model.eval()
-
         return self._model
 
     def transcribe(
         self,
         audio_path: Union[str, Path],
     ) -> Dict[str, Any]:
-        """Transcribe an audio file after Silero VAD trimming."""
+        """Transcribe an audio file using FP16 inference."""
 
-        if self._model is None or self._vad_model is None:
+        if self._model is None:
             raise RuntimeError(
-                "Models are not loaded. "
+                "Whisper FP16 model is not loaded. "
                 "Call load() before transcribe()."
             )
 
@@ -182,311 +133,68 @@ class WhisperVadAdapter(BaseAdapter):
                 f"Audio file was not found: {audio_path}"
             )
 
-        if not audio_path.is_file():
-            raise ValueError(
-                f"Audio path is not a file: {audio_path}"
-            )
-
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
-
-        total_start = time.perf_counter()
-
-        # -------------------------------------------------
-        # Stage 1: Whisper-compatible audio loading
-        # -------------------------------------------------
-        audio_load_start = time.perf_counter()
-
-        try:
-            # whisper.load_audio() uses Whisper's standard
-            # file-decoding, mono-conversion and 16 kHz
-            # resampling path, matching the baseline.
-            audio_data = whisper.load_audio(
-                str(audio_path)
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to load audio file "
-                f"'{audio_path}': {exc}"
-            ) from exc
-
-        audio_load_ms = (
-            time.perf_counter() - audio_load_start
-        ) * 1000
-
-        if audio_data.size == 0:
-            raise ValueError(
-                f"Audio file contains no samples: {audio_path}"
-            )
-
-        if not np.isfinite(audio_data).all():
-            raise ValueError(
-                f"Audio file contains invalid numeric values: "
-                f"{audio_path}"
-            )
-
-        audio_data = np.asarray(
-            audio_data,
-            dtype=np.float32,
+        torch.cuda.synchronize(
+            device=self.device
         )
 
-        waveform = torch.from_numpy(
-            np.ascontiguousarray(audio_data)
-        ).to(
-            dtype=torch.float32,
-            device="cpu",
-        )
-
-        original_samples = int(
-            waveform.numel()
-        )
-
-        original_duration_s = (
-            original_samples / self.sample_rate
-        )
-
-        # -------------------------------------------------
-        # Stage 2: Silero VAD inference
-        # -------------------------------------------------
-        vad_inference_start = time.perf_counter()
-
-        with torch.inference_mode():
-            speech_timestamps = get_speech_timestamps(
-                waveform,
-                self._vad_model,
-                sampling_rate=self.sample_rate,
-                threshold=self.vad_threshold,
-                min_speech_duration_ms=(
-                    self.min_speech_duration_ms
-                ),
-                min_silence_duration_ms=(
-                    self.min_silence_duration_ms
-                ),
-                speech_pad_ms=self.speech_pad_ms,
-                return_seconds=False,
-            )
-
-        vad_inference_ms = (
-            time.perf_counter() - vad_inference_start
-        ) * 1000
-
-        # -------------------------------------------------
-        # Stage 3: Collect detected speech chunks
-        # -------------------------------------------------
-        chunk_collection_start = time.perf_counter()
-
-        if speech_timestamps:
-            trimmed_waveform = collect_chunks(
-                speech_timestamps,
-                waveform,
-            )
-
-            speech_detected = True
-            used_original_audio_fallback = False
-        else:
-            # Safe fallback: do not pass empty audio to
-            # Whisper when Silero detects no speech.
-            trimmed_waveform = waveform
-
-            speech_detected = False
-            used_original_audio_fallback = True
-
-        if not isinstance(
-            trimmed_waveform,
-            torch.Tensor,
-        ):
-            trimmed_waveform = torch.as_tensor(
-                trimmed_waveform,
-                dtype=torch.float32,
-            )
-
-        trimmed_waveform = (
-            trimmed_waveform
-            .detach()
-            .to(
-                dtype=torch.float32,
-                device="cpu",
-            )
-            .contiguous()
-            .flatten()
-        )
-
-        chunk_collection_ms = (
-            time.perf_counter() - chunk_collection_start
-        ) * 1000
-
-        trimmed_samples = int(
-            trimmed_waveform.numel()
-        )
-
-        if trimmed_samples == 0:
-            # Additional safety fallback in case chunk
-            # collection unexpectedly returns an empty tensor.
-            trimmed_waveform = waveform
-            trimmed_samples = original_samples
-            speech_detected = False
-            used_original_audio_fallback = True
-
-        trimmed_duration_s = (
-            trimmed_samples / self.sample_rate
-        )
-
-        removed_duration_s = max(
-            0.0,
-            original_duration_s - trimmed_duration_s,
-        )
-
-        retained_audio_ratio = (
-            trimmed_duration_s / original_duration_s
-            if original_duration_s > 0
-            else 0.0
-        )
-
-        removed_audio_ratio = (
-            removed_duration_s / original_duration_s
-            if original_duration_s > 0
-            else 0.0
-        )
-
-        # Whisper accepts a NumPy float32 waveform.
-        audio_array = (
-            trimmed_waveform
-            .numpy()
-            .astype(
-                np.float32,
-                copy=False,
-            )
-        )
-
-        vad_preprocessing_ms = (
-            vad_inference_ms + chunk_collection_ms
-        )
-
-        # -------------------------------------------------
-        # Stage 4: Whisper transcription
-        # -------------------------------------------------
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
-
-        whisper_start = time.perf_counter()
+        start_time = time.perf_counter()
 
         result = self._model.transcribe(
-            audio_array,
+            str(audio_path),
             task="transcribe",
             language="en",
-
-            # Keep precision aligned with the corrected
-            # Whisper FP32 baseline.
-            fp16=False,
-
-            # Temperature and condition_on_previous_text
-            # are intentionally left unspecified so Whisper
-            # retains the baseline defaults.
+            fp16=True,
         )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+        torch.cuda.synchronize(
+            device=self.device
+        )
 
-        whisper_latency_ms = (
-            time.perf_counter() - whisper_start
-        ) * 1000
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000.0
 
-        text = result.get(
-            "text",
-            "",
+        text = str(
+            result.get(
+                "text",
+                "",
+            )
+            or ""
         ).strip()
-
-        total_latency_ms = (
-            time.perf_counter() - total_start
-        ) * 1000
-
-        real_time_factor = (
-            total_latency_ms / 1000
-        ) / original_duration_s if original_duration_s > 0 else None
-
-        whisper_real_time_factor = (
-            whisper_latency_ms / 1000
-        ) / trimmed_duration_s if trimmed_duration_s > 0 else None
 
         return {
             "text": text,
-            "latency_ms": total_latency_ms,
+            "latency_ms": latency_ms,
             "meta": {
                 "implementation": "openai-whisper",
                 "backend": "whisper",
-                "optimization": (
-                    "silero_vad_silence_trimming"
-                ),
-                "experimental_change": (
-                    "Silero VAD preprocessing before "
-                    "Whisper transcription"
-                ),
+                "adapter": self.name,
                 "model_size": self.model_size,
                 "device": self.device,
-                "precision": "fp32",
-                "language": "en",
+                "precision": "fp16",
                 "decoding": "default_transcribe",
-                "condition_on_previous_text": True,
-                "temperature_fallback_enabled": True,
-                "vad_backend": "silero_vad",
-                "vad_device": "cpu",
-                "sample_rate": self.sample_rate,
-                "vad_threshold": self.vad_threshold,
-                "min_speech_duration_ms": (
-                    self.min_speech_duration_ms
-                ),
-                "min_silence_duration_ms": (
-                    self.min_silence_duration_ms
-                ),
-                "speech_pad_ms": self.speech_pad_ms,
-                "speech_detected": speech_detected,
-                "used_original_audio_fallback": (
-                    used_original_audio_fallback
-                ),
-                "speech_segment_count": len(
-                    speech_timestamps
-                ),
-                "original_samples": original_samples,
-                "trimmed_samples": trimmed_samples,
-                "original_duration_s": original_duration_s,
-                "trimmed_duration_s": trimmed_duration_s,
-                "removed_duration_s": removed_duration_s,
-                "retained_audio_ratio": retained_audio_ratio,
-                "removed_audio_ratio": removed_audio_ratio,
-                "audio_load_ms": audio_load_ms,
-                "vad_inference_ms": vad_inference_ms,
-                "chunk_collection_ms": chunk_collection_ms,
-                "vad_preprocessing_ms": vad_preprocessing_ms,
-                "whisper_latency_ms": whisper_latency_ms,
-                "real_time_factor": real_time_factor,
-                "whisper_real_time_factor": (
-                    whisper_real_time_factor
-                ),
+                "task": "transcribe",
+                "language": "en",
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
                 "latency_includes": [
-                    "whisper_compatible_audio_loading",
-                    "audio_decoding",
-                    "mono_conversion",
+                    "audio_loading",
                     "audio_resampling",
-                    "silero_vad_inference",
-                    "speech_chunk_collection",
-                    "waveform_conversion",
-                    "whisper_encoder",
-                    "whisper_decoder",
+                    "padding_or_trimming",
+                    "mel_spectrogram",
+                    "encoder",
+                    "decoder",
                     "text_generation",
                 ],
             },
         }
 
     def close(self) -> None:
-        """Release Whisper and Silero VAD resources."""
-
-        used_cuda = self.device.startswith("cuda")
+        """Release model and CUDA resources."""
 
         self._model = None
-        self._vad_model = None
 
         gc.collect()
 
-        if used_cuda:
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
