@@ -79,6 +79,9 @@ class WhisperAdapter(BaseAdapter):
 
         model = self.load()
 
+        if is_cuda:
+            torch.cuda.synchronize()
+
         t0 = time.perf_counter()
         audio = whisper.load_audio(str(audio_path))
         t1 = time.perf_counter()
@@ -91,13 +94,15 @@ class WhisperAdapter(BaseAdapter):
             torch.cuda.synchronize()
         t3 = time.perf_counter()
 
-        model.encoder(mel.unsqueeze(0))
+        with torch.inference_mode():
+            model.encoder(mel.unsqueeze(0))
         if is_cuda:
             torch.cuda.synchronize()
         t4 = time.perf_counter()
 
         options = whisper.DecodingOptions(fp16=False)
-        whisper.decode(model, mel, options)
+        with torch.inference_mode():
+            whisper.decode(model, mel, options)
         if is_cuda:
             torch.cuda.synchronize()
         t5 = time.perf_counter()
