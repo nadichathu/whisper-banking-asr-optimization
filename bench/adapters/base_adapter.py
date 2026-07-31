@@ -21,6 +21,7 @@ class WhisperAdapter(BaseAdapter):
         super().__init__(config)
 
         config = config or {}
+        self.name = "whisper"
         self.model_size = config.get("model_size", MODEL_SIZE)
 
         requested_device = str(config.get("device", DEVICE)).lower()
@@ -71,21 +72,36 @@ class WhisperAdapter(BaseAdapter):
             },
         }
 
-    def profile(self, audio_path: str) -> Dict[str, float]:
+    def profile(self, audio_path: str) -> Dict[str, Any]:
         # mimic profiling from profiling/profile_whisper.py
+        import torch
+        is_cuda = self.device.startswith("cuda")
+
         model = self.load()
+
         t0 = time.perf_counter()
         audio = whisper.load_audio(str(audio_path))
         t1 = time.perf_counter()
+
         audio = whisper.pad_or_trim(audio)
         t2 = time.perf_counter()
+
         mel = whisper.log_mel_spectrogram(audio, n_mels=model.dims.n_mels).to(model.device)
+        if is_cuda:
+            torch.cuda.synchronize()
         t3 = time.perf_counter()
+
         model.encoder(mel.unsqueeze(0))
+        if is_cuda:
+            torch.cuda.synchronize()
         t4 = time.perf_counter()
+
         options = whisper.DecodingOptions(fp16=False)
         whisper.decode(model, mel, options)
+        if is_cuda:
+            torch.cuda.synchronize()
         t5 = time.perf_counter()
+
         return {
             "load_audio_ms": (t1 - t0) * 1000,
             "pad_trim_ms": (t2 - t1) * 1000,
