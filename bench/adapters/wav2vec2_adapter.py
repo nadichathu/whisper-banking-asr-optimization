@@ -12,7 +12,7 @@ from bench.config import WAV2VEC_MODEL_ID
 
 
 class Wav2Vec2Adapter(BaseAdapter):
-    """Wav2Vec2 CTC adapter for end-to-end ASR benchmarking.
+    """Wav2Vec2 CTC adapter for end-to-end ASR benchmarking. GPU-only.
 
     The reported latency includes:
 
@@ -30,7 +30,6 @@ class Wav2Vec2Adapter(BaseAdapter):
     ):
         super().__init__(config)
 
-        self.config = config or {}
         self.name = "wav2vec2"
 
         self.model_id = self.config.get(
@@ -42,17 +41,20 @@ class Wav2Vec2Adapter(BaseAdapter):
             self.config.get("device", "cuda")
         ).lower()
 
-        if requested_device.startswith("cuda"):
-            if torch.cuda.is_available():
-                self.device = requested_device
-            else:
-                print(
-                    "CUDA was requested for Wav2Vec2, "
-                    "but CUDA is unavailable. Falling back to CPU."
-                )
-                self.device = "cpu"
-        else:
-            self.device = "cpu"
+        if not requested_device.startswith("cuda"):
+            raise ValueError(
+                "This benchmark suite is GPU-only. "
+                f"Received device='{requested_device}'. "
+                "Run with '--device cuda' or '--device cuda:0'."
+            )
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but no CUDA-compatible GPU "
+                "is available in the current environment."
+            )
+
+        self.device = requested_device
 
         self._processor = None
         self._model = None
@@ -159,8 +161,7 @@ class Wav2Vec2Adapter(BaseAdapter):
                 f"Audio file not found: {audio_path}"
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
@@ -172,7 +173,8 @@ class Wav2Vec2Adapter(BaseAdapter):
             waveform.shape[-1] / self.sample_rate
         )
 
-        # Hugging Face processors operate on CPU waveform data.
+        # Hugging Face processors operate on CPU waveform data
+        # before transfer to the GPU below.
         audio_array = waveform.cpu().numpy()
 
         processed_inputs = self._processor(
@@ -203,8 +205,7 @@ class Wav2Vec2Adapter(BaseAdapter):
             predicted_ids_cpu
         )[0].strip()
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         latency_ms = (
             time.perf_counter() - start_time
@@ -228,6 +229,7 @@ class Wav2Vec2Adapter(BaseAdapter):
                 "real_time_factor": real_time_factor,
                 "decoding": "ctc_greedy",
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
                 "latency_includes": [
                     "audio_loading",
                     "mono_conversion",
@@ -242,12 +244,9 @@ class Wav2Vec2Adapter(BaseAdapter):
     def close(self) -> None:
         """Release model and processor resources."""
 
-        used_cuda = self.device.startswith("cuda")
-
         self._model = None
         self._processor = None
 
         gc.collect()
 
-        if used_cuda:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
