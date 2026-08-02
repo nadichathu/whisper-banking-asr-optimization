@@ -40,6 +40,18 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
     does not reproduce the complete long-audio segmentation and context
     management performed by ``model.transcribe()``. This is acceptable for
     short banking commands but must be documented in the methodology.
+
+    Research limitation (encoder cost on fallback):
+    ``whisper.decode()`` recomputes the encoder on every call, since the
+    public API provides no way to reuse a precomputed encoder output across
+    calls. Whisper's internal ``transcribe()`` pipeline, by contrast,
+    computes the encoder once and reuses it across every temperature
+    attempt in its fallback loop. Consequently, on any file where fallback
+    actually triggers (see ``fallback_used`` in the returned metadata),
+    this adapter pays for one additional full encoder pass per extra
+    temperature attempt -- a cost that is specific to this adapter's API
+    choice, not to the direct-decode technique in general, and that
+    inflates latency only on fallback-triggering files.
     """
 
     DEFAULT_TEMPERATURES = (
@@ -278,7 +290,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         # Start before audio loading so the latency boundary
         # matches the file-to-text baseline measurement.
@@ -341,7 +353,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
         ).to(self.device)
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         mel_spectrogram_ms = (
             time.perf_counter() - mel_start
@@ -351,7 +363,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
         # Stage 4: Direct decoding with fallback
         # -------------------------------------------------
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         decode_start = time.perf_counter()
 
@@ -365,7 +377,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
         )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         decode_latency_ms = (
             time.perf_counter() - decode_start
@@ -499,6 +511,18 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                     "trimmed 30-second window and does not "
                     "replicate transcribe() long-audio "
                     "segmentation or context propagation."
+                ),
+                "fallback_encoder_recompute_note": (
+                    "whisper.decode() recomputes the encoder on "
+                    "every call, unlike transcribe()'s internal "
+                    "pipeline which reuses one encoder pass across "
+                    "all fallback attempts. On files where "
+                    "fallback_used is True, this adapter's latency "
+                    "includes one additional full encoder pass per "
+                    "extra temperature attempt, a cost specific to "
+                    "this adapter's use of the low-level decode() "
+                    "API rather than to the direct-decode technique "
+                    "in general."
                 ),
             },
         }
