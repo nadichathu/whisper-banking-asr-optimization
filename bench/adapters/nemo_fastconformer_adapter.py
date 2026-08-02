@@ -1,99 +1,174 @@
-from typing import Any, Dict
+import gc
 import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
 
-from bench.adapters.base_adapter import BaseAdapter
+import torch
+
+from .base_adapter import BaseAdapter
 
 
 class NeMoFastConformerAdapter(BaseAdapter):
-    """Adapter for NVIDIA NeMo FastConformer/ASR models.
+    """Adapter for NVIDIA NeMo FastConformer ASR models.
 
-    This adapter tries to load a pretrained NeMo ASR model via
-    ``ASRModel.from_pretrained(...)``. If NeMo or compatible pretrained
-    models are not available in the environment this will raise a
-    RuntimeError with an actionable message.
+    Used as an external comparator model during the model-selection phase,
+    alongside Wav2Vec2 and Parakeet, not as a subject of the Whisper
+    inference-time optimisation experiments.
 
-    Notes:
-    - NeMo typically requires a matching PyTorch/CUDA setup for GPU models.
-    - If you only have CPU, some NeMo models may not run or will be extremely slow.
+    Unlike an earlier version of this adapter, this one REQUIRES an
+    explicit model_name and does not silently fall back across a list of
+    candidate architectures (e.g. FastConformer -> QuartzNet). Reporting
+    "FastConformer" results that were actually produced by a different
+    architecture, chosen implicitly based on what happened to load
+    successfully in a given environment, would be a reproducibility
+    problem for the dissertation. Pass model_name explicitly, e.g.:
+
+        NeMoFastConformerAdapter({"model_name": "stt_en_fastconformer_base"})
     """
 
-    def __init__(self, config: Dict[str, Any] = None):
+    DEFAULT_MODEL_NAME = "stt_en_fastconformer_base"
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
+
+        self.config = config or {}
+        self.model_name = self.config.get("model_name", self.DEFAULT_MODEL_NAME)
+        self.name = "nemo_fastconformer"
+
+        requested_device = str(
+            self.config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        ).lower().strip()
+
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            print("CUDA was requested but is unavailable. Falling back to CPU.")
+            requested_device = "cpu"
+
+        self.device = requested_device
+        self.batch_size = int(self.config.get("batch_size", 1))
         self.model = None
-        self.model_id = None
 
-    def load(self):
+    def load(self) -> None:
+        """Load the specified pretrained NeMo FastConformer model.
+
+        Fails loudly (RuntimeError) if the exact requested model_name
+        cannot be loaded, rather than silently substituting a different
+        architecture.
+        """
+
+        if self.model is not None:
+            return
+
         try:
-            # Imported lazily so environments without NeMo still import the package
             from nemo.collections.asr.models import ASRModel
-        except Exception as e:  # pragma: no cover - environment dependent
-            raise RuntimeError(
-                "NeMo is not available in this Python environment. "
-                "Install nemo-toolkit (and a compatible PyTorch/CUDA) to use the NeMo adapter."
-            ) from e
+        except ImportError as exc:
+            raise ImportError(
+                "NVIDIA NeMo is not installed. Install it with:\n"
+                'pip install "nemo_toolkit[asr]"'
+            ) from exc
 
-        # model_name can be provided via config; otherwise try a few common names
-        requested = self.config.get("model_name") if self.config else None
-        candidates = [requested] if requested else []
-        candidates += [
-            # common NeMo Hub identifiers - availability depends on your nemo version
-            "stt_en_fastconformer_base",
-            "stt_en_fastconformer_small",
-            "stt_en_fastconformer_tiny",
-            "stt_en_quartznet15x5",
-        ]
+        print(f"Loading NeMo model: {self.model_name}")
 
-        last_exc = None
-        for cand in filter(None, candidates):
-            try:
-                # from_pretrained will download the model if needed
-                self.model = ASRModel.from_pretrained(cand)
-                self.model_id = cand
-                return
-            except Exception as e:  # try next candidate
-                last_exc = e
-
-        # nothing loaded
-        msg = (
-            "Failed to load a NeMo ASR pretrained model. "
-            "Tried candidates: %s. Ensure nemo-toolkit is installed and you have "
-            "the correct CUDA/PyTorch environment for NeMo models. "
-            "%s" % (candidates, str(last_exc))
-        )
-        raise RuntimeError(msg)
-
-    def transcribe(self, audio_path: str) -> Dict[str, Any]:
-        if self.model is None:
-            raise RuntimeError("Model not loaded; call load() before transcribing")
-
-        # NeMo ASR models expose a .transcribe(list_of_files) helper
-        t0 = time.perf_counter()
-        hyps = self.model.transcribe([audio_path])
-        t1 = time.perf_counter()
-
-        text = hyps[0] if hyps else ""
-        return {"text": text, "meta": {"transcribe_ms": (t1 - t0) * 1000}}
-
-    def profile(self, audio_path: str) -> Dict[str, float]:
-        # Basic profiling wraps the transcribe call. NeMo does not currently
-        # expose easy stage-level hooks here without deeper instrumentation.
-        t0 = time.perf_counter()
-        _ = self.model.transcribe([audio_path])
-        t1 = time.perf_counter()
-        return {"transcribe_ms": (t1 - t0) * 1000}
-
-    def close(self):
-        # Try to free GPU memory if used
         try:
-            import gc
-            del self.model
-            gc.collect()
-            try:
-                import torch
+            self.model = ASRModel.from_pretrained(model_name=self.model_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load NeMo model '{self.model_name}'. "
+                "Check that this exact model name is available for your "
+                "installed NeMo version, and that model_name is set "
+                "explicitly in config rather than relying on a default."
+            ) from exc
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-        except Exception:
-            pass
+        self.model.eval()
+        self.model = self.model.to(self.device)
+
+        print(f"NeMo FastConformer loaded on device: {self.device}")
+
+    def transcribe(self, audio_path: Union[str, Path]) -> Dict[str, Any]:
+        """Transcribe one audio file and measure end-to-end latency."""
+
+        if self.model is None:
+            raise RuntimeError(
+                "NeMo model has not been loaded. Call load() before transcribe()."
+            )
+
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+        start_time = time.perf_counter()
+
+        with torch.inference_mode():
+            outputs = self.model.transcribe(
+                audio=[str(audio_path)],
+                batch_size=self.batch_size,
+                verbose=False,
+            )
+
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+
+        text = self._extract_text(outputs)
+
+        return {
+            "text": text,
+            "latency_ms": latency_ms,
+            "meta": {
+                "implementation": "NVIDIA NeMo",
+                "model_name": self.model_name,
+                "architecture": "FastConformer",
+                "device": self.device,
+                "batch_size": self.batch_size,
+                "latency_type": "end_to_end",
+            },
+        }
+
+    @staticmethod
+    def _extract_text(outputs: Any) -> str:
+        """Handle different NeMo transcription return formats.
+
+        NeMo's transcribe() may return plain strings, Hypothesis objects
+        with a .text attribute, or dict-like results depending on version
+        and model type. Do not assume a bare string -- that would silently
+        store a non-string object and corrupt downstream WER computation.
+        """
+
+        if outputs is None:
+            return ""
+
+        if not isinstance(outputs, (list, tuple)):
+            outputs = [outputs]
+
+        if not outputs:
+            return ""
+
+        first_output = outputs[0]
+
+        if hasattr(first_output, "text"):
+            return str(first_output.text or "").strip()
+
+        if isinstance(first_output, str):
+            return first_output.strip()
+
+        if isinstance(first_output, dict):
+            return str(first_output.get("text", "") or "").strip()
+
+        return str(first_output).strip()
+
+    def close(self) -> None:
+        """Release model and GPU memory."""
+
+        used_cuda = self.device.startswith("cuda")
+
+        if self.model is not None:
+            del self.model
+            self.model = None
+
+        gc.collect()
+
+        if used_cuda:
+            torch.cuda.empty_cache()
