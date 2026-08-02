@@ -29,7 +29,8 @@ ADAPTER_REGISTRY = {
     "wav2vec2": ("bench.adapters.wav2vec2_adapter", "Wav2Vec2Adapter"),
     "parakeet": ("bench.adapters.parakeet_adapter", "ParakeetAdapter"),
     "nemo_fastconformer": ("bench.adapters.nemo_fastconformer_adapter", "NeMoFastConformerAdapter"),
-    # "vosk" removed from the comparator set at the user's request.
+    # "vosk" removed from the comparator set: Vosk is CPU-only (Kaldi-based)
+    # and this benchmark suite is GPU-only throughout.
 }
 
 
@@ -66,23 +67,26 @@ def resolve_model_name(adapter: Any, fallback_name: str) -> str:
     return str(model_name).replace("/", "_").replace("\\", "_").replace(" ", "_")
 
 
-def synchronize_if_cuda(device: Optional[str]) -> None:
-    """Synchronize CUDA when the selected device is CUDA."""
-    if device and str(device).lower().startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
+def validate_device(requested_device: Optional[str]) -> str:
+    """Validate the selected device. This benchmark suite is GPU-only:
+    defaults to 'cuda' if not specified, and fails fast (rather than
+    falling back to CPU) if CUDA is unavailable or a non-CUDA device
+    string is passed."""
 
+    device = (requested_device or "cuda").lower().strip()
 
-def validate_device(requested_device: Optional[str]) -> Optional[str]:
-    """Validate the user-selected device, failing fast rather than falling back silently."""
-    if requested_device is None:
-        return None
+    if not device.startswith("cuda"):
+        raise SystemExit(
+            f"This benchmark suite is GPU-only. Received device='{device}'. "
+            "Use '--device cuda' or '--device cuda:0'."
+        )
 
-    requested_device = requested_device.lower().strip()
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            f"Device '{device}' was requested, but CUDA is not available."
+        )
 
-    if requested_device.startswith("cuda") and not torch.cuda.is_available():
-        raise SystemExit(f"Device '{requested_device}' was requested, but CUDA is not available.")
-
-    return requested_device
+    return device
 
 
 def calculate_difference_percent(adapter_latency_ms: float, runner_wall_latency_ms: float) -> float:
@@ -176,7 +180,7 @@ def run_benchmark(
         adapter.load()
 
         model_name = resolve_model_name(adapter, result_name or adapter_class.__name__.lower())
-        adapter_device = str(getattr(adapter, "device", effective_config.get("device", "unspecified")))
+        adapter_device = str(getattr(adapter, "device", effective_config.get("device", "cuda")))
 
         audio_dir = pathlib.Path(AUDIO_DIR)
         results_dir = pathlib.Path(RESULTS_DIR)
@@ -236,12 +240,12 @@ def run_benchmark(
             transcripts = []
 
             for run_index in range(N_RUNS):
-                synchronize_if_cuda(adapter_device)
+                torch.cuda.synchronize()
                 wall_start = time.perf_counter()
 
                 output = adapter.transcribe(audio_path)
 
-                synchronize_if_cuda(adapter_device)
+                torch.cuda.synchronize()
                 runner_wall_latency_ms = (time.perf_counter() - wall_start) * 1000.0
 
                 if not isinstance(output, dict):
@@ -372,7 +376,7 @@ def run_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark speech-recognition adapters for the banking voice-command dataset."
+        description="Benchmark speech-recognition adapters for the banking voice-command dataset. GPU-only."
     )
 
     parser.add_argument(
@@ -385,8 +389,8 @@ def main() -> None:
         "--device",
         type=str,
         default=None,
-        help="Device passed to the adapter, e.g. 'cpu', 'cuda', or 'cuda:0'. "
-             "When omitted, the adapter or bench.config selects the device.",
+        help="CUDA device, e.g. 'cuda' or 'cuda:0'. Defaults to 'cuda'. "
+             "This benchmark suite is GPU-only; non-CUDA values are rejected.",
     )
     parser.add_argument(
         "--model-size",
@@ -400,24 +404,12 @@ def main() -> None:
         default=None,
         help="Optional maximum number of WAV files to benchmark.",
     )
-    parser.add_argument(
-        "--cpu-threads",
-        type=int,
-        default=4,
-        help="Number of PyTorch CPU threads. Default: 4.",
-    )
 
     args = parser.parse_args()
 
-    if args.cpu_threads <= 0:
-        raise SystemExit("--cpu-threads must be greater than zero.")
-    torch.set_num_threads(args.cpu_threads)
+    validated_device = validate_device(args.device)
 
-    requested_device = validate_device(args.device)
-
-    adapter_config: Dict[str, Any] = {}
-    if requested_device is not None:
-        adapter_config["device"] = requested_device
+    adapter_config: Dict[str, Any] = {"device": validated_device}
     if args.model_size is not None:
         adapter_config["model_size"] = args.model_size
 
