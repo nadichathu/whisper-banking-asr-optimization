@@ -12,6 +12,7 @@ from bench.config import DEVICE, MODEL_SIZE
 
 class WhisperDirectDecodeAdapter(BaseAdapter):
     """OpenAI Whisper using the lower-level ``whisper.decode()`` API.
+    GPU-only.
 
     Experimental approach:
 
@@ -69,7 +70,6 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
     ):
         super().__init__(config)
 
-        self.config = config or {}
         self.name = "whisper_direct_decode"
 
         self.model_size = self.config.get(
@@ -84,17 +84,20 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             )
         ).lower()
 
-        if requested_device.startswith("cuda"):
-            if torch.cuda.is_available():
-                self.device = requested_device
-            else:
-                print(
-                    "CUDA was requested but is unavailable. "
-                    "Falling back to CPU."
-                )
-                self.device = "cpu"
-        else:
-            self.device = "cpu"
+        if not requested_device.startswith("cuda"):
+            raise ValueError(
+                "This benchmark suite is GPU-only. "
+                f"Received device='{requested_device}'. "
+                "Run with '--device cuda' or '--device cuda:0'."
+            )
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but no CUDA-compatible GPU "
+                "is available in the current environment."
+            )
+
+        self.device = requested_device
 
         configured_temperatures = self.config.get(
             "temperatures",
@@ -289,8 +292,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 f"Audio path is not a file: {audio_path}"
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         # Start before audio loading so the latency boundary
         # matches the file-to-text baseline measurement.
@@ -352,8 +354,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             n_mels=self._model.dims.n_mels,
         ).to(self.device)
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         mel_spectrogram_ms = (
             time.perf_counter() - mel_start
@@ -362,8 +363,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
         # -------------------------------------------------
         # Stage 4: Direct decoding with fallback
         # -------------------------------------------------
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         decode_start = time.perf_counter()
 
@@ -376,8 +376,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             mel
         )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         decode_latency_ms = (
             time.perf_counter() - decode_start
@@ -495,6 +494,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                     real_time_factor
                 ),
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
                 "latency_includes": [
                     "audio_loading",
                     "audio_decoding",
@@ -530,11 +530,8 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
     def close(self) -> None:
         """Release Whisper model resources."""
 
-        used_cuda = self.device.startswith("cuda")
-
         self._model = None
 
         gc.collect()
 
-        if used_cuda:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
