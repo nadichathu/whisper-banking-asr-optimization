@@ -1,43 +1,30 @@
-# --- Core deep learning stack ---
-# NOTE: pin these before final submission (see below) -- unpinned versions
-# undermine the reproducibility claims made in Chapter 3.
+# Core deep learning stack
 torch
 torchaudio
-# torchvision  # not used anywhere in this codebase; remove unless something needs it
 
-# --- ASR models / backends ---
+# ASR models / backends
 openai-whisper
 faster-whisper
 ctranslate2
-nemo_toolkit[asr]      # required by bench/adapters/parakeet_adapter.py -- was missing
+nemo_toolkit[asr]
 
-# --- Hugging Face stack (Wav2Vec2, MINDS-14 loading, metrics) ---
+# Hugging Face stack (Wav2Vec2, MINDS-14 loading, metrics)
 transformers
 datasets
 evaluate
 
-# vosk   # removed: Vosk dropped from ADAPTER_REGISTRY; re-add only if you
-#          need the package installed to inspect/reproduce old Vosk results
-
-# --- Data handling / metrics ---
+# Data handling / metrics
 pandas
 numpy
 scipy
-jiwer                  # confirm this, not `evaluate`'s WER metric, is what
-                        # bench/utils.py:compute_wer() actually uses
+jiwer
 
-# --- Utilities ---
+# Utilities
 tqdm
 matplotlib
 psutil
 
-# --- Audio I/O ---
+# Audio I/O
 soundfile
 librosa
-
-# openpyxl  # no .xlsx output found in runner/adapters; keep only if used
-#             for manual dataset curation outside the benchmark pipeline
-
-silero-vad              # PyPI convention uses a hyphen; pip normalizes
-                         # underscore/hyphen equivalently, so this is
-                         # cosmetic, not a functional fix
+silero-vad
