@@ -15,12 +15,6 @@ SAMPLE_RATE = 16000
 DEVICE = "cuda"
 MODEL_SIZE = "small"
 
-# Whether to include network latency for cloud adapters
-# NOTE: not currently read by any adapter or by runner.py -- either wire
-# this into a cloud-API adapter if one is planned, or remove it if it is
-# dead configuration left over from an earlier design.
-INCLUDE_NETWORK_LATENCY = True
-
 # Wav2Vec2 default model id (HF)
 WAV2VEC_MODEL_ID = "facebook/wav2vec2-base-960h"
 
