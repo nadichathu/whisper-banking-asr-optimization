@@ -74,12 +74,20 @@ class WhisperVadAdapter(BaseAdapter):
 
         self.device = requested_device
 
-        self.sample_rate = int(
-            self.config.get(
-                "sample_rate",
-                16000,
+        # whisper.load_audio() always decodes and resamples to Whisper's
+        # native rate (16 kHz) internally via FFmpeg -- this is not
+        # configurable. A user-settable sample_rate here would mislabel
+        # the actual waveform rate passed to Silero VAD (e.g. declaring
+        # 8000 while the waveform is actually 16 kHz), which would corrupt
+        # VAD's speech-timestamp detection and this adapter's own
+        # duration calculations. Fixed to match whisper.audio.SAMPLE_RATE.
+        self.sample_rate = whisper.audio.SAMPLE_RATE
+
+        if self.sample_rate != 16000:
+            raise RuntimeError(
+                f"Unexpected Whisper native sample rate: {self.sample_rate}. "
+                "whisper.audio.SAMPLE_RATE was expected to be 16000."
             )
-        )
 
         self.vad_threshold = float(
             self.config.get(
@@ -108,12 +116,6 @@ class WhisperVadAdapter(BaseAdapter):
                 100,
             )
         )
-
-        if self.sample_rate not in {8000, 16000}:
-            raise ValueError(
-                "Silero VAD supports sample rates of "
-                "8000 Hz or 16000 Hz."
-            )
 
         if not 0.0 <= self.vad_threshold <= 1.0:
             raise ValueError(
