@@ -11,7 +11,7 @@ from bench.config import DEVICE, MODEL_SIZE
 
 
 class WhisperGreedyAdapter(BaseAdapter):
-    """OpenAI Whisper adapter using greedy-only decoding.
+    """OpenAI Whisper adapter using greedy-only decoding. GPU-only.
 
     Experimental change relative to the FP32 Whisper baseline:
 
@@ -33,7 +33,6 @@ class WhisperGreedyAdapter(BaseAdapter):
     ):
         super().__init__(config)
 
-        self.config = config or {}
         self.name = "whisper_greedy"
 
         self.model_size = self.config.get(
@@ -45,17 +44,20 @@ class WhisperGreedyAdapter(BaseAdapter):
             self.config.get("device", DEVICE)
         ).lower()
 
-        if requested_device.startswith("cuda"):
-            if torch.cuda.is_available():
-                self.device = requested_device
-            else:
-                print(
-                    "CUDA was requested but is unavailable. "
-                    "Falling back to CPU."
-                )
-                self.device = "cpu"
-        else:
-            self.device = "cpu"
+        if not requested_device.startswith("cuda"):
+            raise ValueError(
+                "This benchmark suite is GPU-only. "
+                f"Received device='{requested_device}'. "
+                "Run with '--device cuda' or '--device cuda:0'."
+            )
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but no CUDA-compatible GPU "
+                "is available in the current environment."
+            )
+
+        self.device = requested_device
 
         self._model = None
 
@@ -101,8 +103,7 @@ class WhisperGreedyAdapter(BaseAdapter):
                 f"Audio path is not a file: {audio_path}"
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+        torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
@@ -122,8 +123,7 @@ class WhisperGreedyAdapter(BaseAdapter):
             condition_on_previous_text=True,
         )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+        torch.cuda.synchronize(device=self.device)
 
         latency_ms = (
             time.perf_counter() - start_time
@@ -149,6 +149,7 @@ class WhisperGreedyAdapter(BaseAdapter):
                 "temperature_fallback_enabled": False,
                 "condition_on_previous_text": True,
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
                 "latency_includes": [
                     "audio_loading",
                     "audio_resampling",
@@ -167,11 +168,8 @@ class WhisperGreedyAdapter(BaseAdapter):
     def close(self) -> None:
         """Release Whisper model resources."""
 
-        used_cuda = self.device.startswith("cuda")
-
         self._model = None
 
         gc.collect()
 
-        if used_cuda:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
