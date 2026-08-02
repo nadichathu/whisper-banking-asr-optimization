@@ -3,13 +3,14 @@ import importlib
 import pathlib
 import statistics as stats
 import time
+from collections import Counter
 from typing import Any, Dict, List, Optional, Type
 
 import pandas as pd
 import torch
 
 from bench.config import AUDIO_DIR, METADATA_FILE, N_RUNS, N_WARMUP, RESULTS_DIR
-from bench.utils import compute_wer, ensure_dir, env_metadata, json_dumps_safe, percentile
+from bench.utils import compute_cer, compute_wer, ensure_dir, env_metadata, json_dumps_safe, percentile
 
 
 ADAPTER_REGISTRY = {
@@ -71,22 +72,32 @@ def validate_device(requested_device: Optional[str]) -> str:
     """Validate the selected device. This benchmark suite is GPU-only:
     defaults to 'cuda' if not specified, and fails fast (rather than
     falling back to CPU) if CUDA is unavailable or a non-CUDA device
-    string is passed."""
+    string is passed. Also validates a specific CUDA index if given
+    (e.g. 'cuda:1'), since torch.cuda.is_available() alone does not
+    confirm that a particular index actually exists."""
 
-    device = (requested_device or "cuda").lower().strip()
+    device_str = (requested_device or "cuda").lower().strip()
 
-    if not device.startswith("cuda"):
+    if not device_str.startswith("cuda"):
         raise SystemExit(
-            f"This benchmark suite is GPU-only. Received device='{device}'. "
+            f"This benchmark suite is GPU-only. Received device='{device_str}'. "
             "Use '--device cuda' or '--device cuda:0'."
         )
 
     if not torch.cuda.is_available():
         raise SystemExit(
-            f"Device '{device}' was requested, but CUDA is not available."
+            f"Device '{device_str}' was requested, but CUDA is not available."
         )
 
-    return device
+    device = torch.device(device_str)
+    if device.index is not None:
+        if device.index < 0 or device.index >= torch.cuda.device_count():
+            raise SystemExit(
+                f"Invalid CUDA device index: {device.index}. "
+                f"Detected {torch.cuda.device_count()} CUDA device(s)."
+            )
+
+    return device_str
 
 
 def calculate_difference_percent(adapter_latency_ms: float, runner_wall_latency_ms: float) -> float:
@@ -154,10 +165,14 @@ def _latency_stats(values: List[float]) -> Dict[str, Optional[float]]:
     measurements. Shared by both the adapter-reported and runner-wall-clock
     latency summaries so the two block are guaranteed to stay consistent."""
     if not values:
-        return {"mean_ms": None, "median_ms": None, "p95_ms": None, "p99_ms": None, "best_ms": None, "worst_ms": None}
+        return {
+            "mean_ms": None, "median_ms": None, "stdev_ms": None,
+            "p95_ms": None, "p99_ms": None, "best_ms": None, "worst_ms": None,
+        }
     return {
         "mean_ms": stats.mean(values),
         "median_ms": percentile(values, 50),
+        "stdev_ms": stats.stdev(values) if len(values) > 1 else 0.0,
         "p95_ms": percentile(values, 95),
         "p99_ms": percentile(values, 99),
         "best_ms": min(values),
@@ -170,6 +185,8 @@ def run_benchmark(
     adapter_config: Optional[Dict[str, Any]] = None,
     max_files: Optional[int] = None,
     result_name: Optional[str] = None,
+    n_warmup: int = N_WARMUP,
+    n_runs: int = N_RUNS,
 ) -> None:
     """Run an adapter benchmark and save detailed per-run, per-file, and summary results."""
 
@@ -214,10 +231,10 @@ def run_benchmark(
         print(f"  Device: {adapter_device}")
         print(f"  Audio directory: {audio_dir}")
         print(f"  Number of files: {len(audio_files)}")
-        print(f"  Warm-up runs: {N_WARMUP}")
-        print(f"  Measured runs per file: {N_RUNS}")
+        print(f"  Warm-up runs: {n_warmup}")
+        print(f"  Measured runs per file: {n_runs}")
 
-        run_global_warmup(adapter=adapter, warmup_audio=audio_files[0], n_warmup=N_WARMUP)
+        run_global_warmup(adapter=adapter, warmup_audio=audio_files[0], n_warmup=n_warmup)
 
         per_run_rows: List[Dict[str, Any]] = []
         per_file_rows: List[Dict[str, Any]] = []
@@ -239,13 +256,13 @@ def run_benchmark(
             runner_wall_latencies = []
             transcripts = []
 
-            for run_index in range(N_RUNS):
-                torch.cuda.synchronize()
+            for run_index in range(n_runs):
+                torch.cuda.synchronize(device=adapter_device)
                 wall_start = time.perf_counter()
 
                 output = adapter.transcribe(audio_path)
 
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device=adapter_device)
                 runner_wall_latency_ms = (time.perf_counter() - wall_start) * 1000.0
 
                 if not isinstance(output, dict):
@@ -266,6 +283,7 @@ def run_benchmark(
                     print("  WARNING: Adapter latency and runner wall-clock latency differ significantly.")
 
                 run_wer = compute_wer(reference, transcript) if reference else None
+                run_cer = compute_cer(reference, transcript) if reference else None
 
                 per_run_rows.append({
                     "file": file_name,
@@ -278,15 +296,28 @@ def run_benchmark(
                     "transcript": transcript,
                     "reference": reference,
                     "wer": run_wer,
+                    "cer": run_cer,
                     "device": adapter_device,
                     "meta": json_dumps_safe(output.get("meta", {})),
                 })
 
-                print(f"  Run {run_index + 1}/{N_RUNS}: adapter={adapter_latency_ms:.2f} ms, wall={runner_wall_latency_ms:.2f} ms")
+                print(f"  Run {run_index + 1}/{n_runs}: adapter={adapter_latency_ms:.2f} ms, wall={runner_wall_latency_ms:.2f} ms")
 
-            median_run_index = sorted(range(len(adapter_latencies)), key=lambda i: adapter_latencies[i])[len(adapter_latencies) // 2]
-            canonical_transcript = transcripts[median_run_index]
+            # Canonical transcript is the MODAL (most common) transcript
+            # across measured runs, not the transcript from whichever run
+            # happened to have median latency -- accuracy should not
+            # depend on runtime performance. For a fully deterministic
+            # adapter, all runs should produce an identical transcript;
+            # transcript_consistent records whether that held here.
+            transcript_consistent = len(set(transcripts)) == 1
+            if not transcript_consistent:
+                print(f"  WARNING: Non-deterministic transcripts across runs for {file_name}")
+
+            canonical_transcript = Counter(transcripts).most_common(1)[0][0]
+            unique_transcript_count = len(set(transcripts))
+
             file_wer = compute_wer(reference, canonical_transcript) if reference else None
+            file_cer = compute_cer(reference, canonical_transcript) if reference else None
 
             adapter_stats = _latency_stats(adapter_latencies)
             wall_stats = _latency_stats(runner_wall_latencies)
@@ -296,17 +327,22 @@ def run_benchmark(
                 "n_runs": len(adapter_latencies),
                 "mean_adapter_latency_ms": adapter_stats["mean_ms"],
                 "median_adapter_latency_ms": adapter_stats["median_ms"],
+                "stdev_adapter_latency_ms": adapter_stats["stdev_ms"],
                 "p95_adapter_latency_ms": adapter_stats["p95_ms"],
                 "p99_adapter_latency_ms": adapter_stats["p99_ms"],
                 "best_adapter_latency_ms": adapter_stats["best_ms"],
                 "worst_adapter_latency_ms": adapter_stats["worst_ms"],
                 "mean_runner_wall_latency_ms": wall_stats["mean_ms"],
                 "median_runner_wall_latency_ms": wall_stats["median_ms"],
+                "stdev_runner_wall_latency_ms": wall_stats["stdev_ms"],
                 "p95_runner_wall_latency_ms": wall_stats["p95_ms"],
                 "p99_runner_wall_latency_ms": wall_stats["p99_ms"],
                 "canonical_transcript": canonical_transcript,
+                "unique_transcript_count": unique_transcript_count,
+                "transcript_consistent": transcript_consistent,
                 "reference": reference,
                 "wer": file_wer,
+                "cer": file_cer,
                 "device": adapter_device,
             })
 
@@ -324,10 +360,16 @@ def run_benchmark(
 
         valid_reference_rows = [row for row in per_file_rows if row["reference"]]
         corpus_wer = None
+        corpus_cer = None
         if valid_reference_rows:
             combined_references = " ".join(row["reference"] for row in valid_reference_rows)
             combined_hypotheses = " ".join(row["canonical_transcript"] for row in valid_reference_rows)
             corpus_wer = compute_wer(combined_references, combined_hypotheses)
+            corpus_cer = compute_cer(combined_references, combined_hypotheses)
+
+        inconsistent_transcript_files = [
+            row["file"] for row in per_file_rows if not row["transcript_consistent"]
+        ]
 
         all_adapter_latencies = [row["adapter_latency_ms"] for row in per_run_rows]
         all_runner_wall_latencies = [row["runner_wall_latency_ms"] for row in per_run_rows]
@@ -342,13 +384,16 @@ def run_benchmark(
             "n_files_without_reference": len(files_without_reference),
             "files_without_reference": files_without_reference,
             "metadata_entries_without_audio": metadata_without_audio,
-            "n_warmup_global": N_WARMUP,
-            "n_runs_per_file": N_RUNS,
+            "n_warmup_global": n_warmup,
+            "n_runs_per_file": n_runs,
             "total_measured_runs": len(per_run_rows),
             "timing_warning_count": timing_warning_count,
+            "n_files_with_inconsistent_transcripts": len(inconsistent_transcript_files),
+            "files_with_inconsistent_transcripts": inconsistent_transcript_files,
             "adapter_latency": _latency_stats(all_adapter_latencies),
             "runner_wall_latency": _latency_stats(all_runner_wall_latencies),
             "corpus_wer": corpus_wer,
+            "corpus_cer": corpus_cer,
             "runs_csv": str(runs_path),
             "per_file_csv": str(per_file_path),
             "environment": env_metadata(),
@@ -404,8 +449,27 @@ def main() -> None:
         default=None,
         help="Optional maximum number of WAV files to benchmark.",
     )
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=N_WARMUP,
+        help=f"Global warm-up runs before measurement. Default: {N_WARMUP} (from config).",
+    )
+    parser.add_argument(
+        "--measured-runs",
+        type=int,
+        default=N_RUNS,
+        help=f"Measured runs per file. Default: {N_RUNS} (from config). "
+             "Note: per-file p95/p99 are unreliable with very few runs; "
+             "increase this for final results if you want stable percentile estimates.",
+    )
 
     args = parser.parse_args()
+
+    if args.warmup_runs < 0:
+        raise SystemExit("--warmup-runs cannot be negative.")
+    if args.measured_runs <= 0:
+        raise SystemExit("--measured-runs must be greater than zero.")
 
     validated_device = validate_device(args.device)
 
@@ -420,6 +484,8 @@ def main() -> None:
         adapter_config=adapter_config,
         max_files=args.max_files,
         result_name=args.model,
+        n_warmup=args.warmup_runs,
+        n_runs=args.measured_runs,
     )
 
 
