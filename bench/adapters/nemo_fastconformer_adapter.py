@@ -23,10 +23,17 @@ class NeMoFastConformerAdapter(BaseAdapter):
     successfully in a given environment, would be a reproducibility
     problem for the dissertation. Pass model_name explicitly, e.g.:
 
-        NeMoFastConformerAdapter({"model_name": "stt_en_fastconformer_base"})
+        NeMoFastConformerAdapter({"model_name": "nvidia/stt_en_fastconformer_ctc_large"})
+
+    nvidia/stt_en_fastconformer_ctc_large was selected as the closest
+    practical NeMo comparator to Whisper Small: it has ~115M parameters
+    versus Whisper Small's ~244M (the next FastConformer tier, XLarge, is
+    ~600M -- further from Whisper Small in the other direction). The models
+    are not equal in parameter count or architecture; report this as a
+    comparison of practical ASR system performance, not a size-matched one.
     """
 
-    DEFAULT_MODEL_NAME = "stt_en_fastconformer_base"
+    DEFAULT_MODEL_NAME = "nvidia/stt_en_fastconformer_ctc_large"
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
