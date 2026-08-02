@@ -28,6 +28,7 @@ ADAPTER_REGISTRY = {
     "faster_whisper_medium": ("bench.adapters.faster_whisper_medium_adapter", "FasterWhisperMediumAdapter"),
     "wav2vec2": ("bench.adapters.wav2vec2_adapter", "Wav2Vec2Adapter"),
     "parakeet": ("bench.adapters.parakeet_adapter", "ParakeetAdapter"),
+    "nemo_fastconformer": ("bench.adapters.nemo_fastconformer_adapter", "NeMoFastConformerAdapter"),
     # "vosk" removed from the comparator set at the user's request.
 }
 
