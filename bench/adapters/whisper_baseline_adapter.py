@@ -91,7 +91,7 @@ class WhisperAdapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
@@ -103,7 +103,7 @@ class WhisperAdapter(BaseAdapter):
         )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         latency_ms = (
             time.perf_counter() - start_time
@@ -170,7 +170,7 @@ class WhisperAdapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         profiling_start = time.perf_counter()
 
@@ -202,7 +202,7 @@ class WhisperAdapter(BaseAdapter):
         ).to(self.device)
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         mel_ms = (
             time.perf_counter() - stage_start
@@ -216,7 +216,7 @@ class WhisperAdapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         encoder_ms = (
             time.perf_counter() - stage_start
@@ -238,7 +238,7 @@ class WhisperAdapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         decode_pipeline_ms = (
             time.perf_counter() - stage_start
