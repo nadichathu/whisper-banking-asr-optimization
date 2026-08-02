@@ -8,6 +8,7 @@ import torchaudio
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 from .base_adapter import BaseAdapter
+from bench.config import WAV2VEC_MODEL_ID
 
 
 class Wav2Vec2Adapter(BaseAdapter):
@@ -34,7 +35,7 @@ class Wav2Vec2Adapter(BaseAdapter):
 
         self.model_id = self.config.get(
             "model_id",
-            "facebook/wav2vec2-base-960h",
+            WAV2VEC_MODEL_ID,
         )
 
         requested_device = str(
@@ -159,7 +160,7 @@ class Wav2Vec2Adapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
@@ -203,7 +204,7 @@ class Wav2Vec2Adapter(BaseAdapter):
         )[0].strip()
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         latency_ms = (
             time.perf_counter() - start_time
