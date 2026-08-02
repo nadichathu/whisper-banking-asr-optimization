@@ -11,7 +11,7 @@ from bench.config import DEVICE, MODEL_SIZE
 
 
 class WhisperFP16Adapter(BaseAdapter):
-    """OpenAI Whisper FP16 adapter for CUDA inference.
+    """OpenAI Whisper FP16 adapter for CUDA inference. GPU-only.
 
     This adapter is intended to isolate the effect of FP16 precision
     relative to the FP32 Whisper baseline.
@@ -35,7 +35,6 @@ class WhisperFP16Adapter(BaseAdapter):
     ):
         super().__init__(config)
 
-        self.config = config or {}
         self.name = "whisper_fp16"
 
         self.model_size = self.config.get(
@@ -196,5 +195,4 @@ class WhisperFP16Adapter(BaseAdapter):
 
         gc.collect()
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
