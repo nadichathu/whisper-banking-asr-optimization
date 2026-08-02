@@ -8,16 +8,14 @@ faster-whisper
 ctranslate2
 nemo_toolkit[asr]
 
-# Hugging Face stack (Wav2Vec2, MINDS-14 loading, metrics)
+# Hugging Face stack (Wav2Vec2, MINDS-14 loading)
 transformers
 datasets
-evaluate
 
 # Data handling / metrics
 pandas
 numpy
 scipy
-jiwer
 
 # Utilities
 tqdm
