@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from .base_adapter import BaseAdapter
+from bench.config import PARAKEET_MODEL_ID
 
 
 class ParakeetAdapter(BaseAdapter):
@@ -28,7 +29,7 @@ class ParakeetAdapter(BaseAdapter):
 
         self.model_id = self.config.get(
             "model_id",
-            "nvidia/parakeet-tdt-0.6b-v2",
+            PARAKEET_MODEL_ID,
         )
 
         requested_device = str(
@@ -110,7 +111,7 @@ class ParakeetAdapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
@@ -122,7 +123,7 @@ class ParakeetAdapter(BaseAdapter):
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         latency_ms = (
             time.perf_counter() - start_time
