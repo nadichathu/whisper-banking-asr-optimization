@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import torch
+import torchaudio
 
 from .base_adapter import BaseAdapter
 
@@ -31,9 +32,16 @@ class NeMoFastConformerAdapter(BaseAdapter):
     ~600M -- further from Whisper Small in the other direction). The models
     are not equal in parameter count or architecture; report this as a
     comparison of practical ASR system performance, not a size-matched one.
+
+    NVIDIA's documentation states that NeMo transcription inputs must be
+    mono and 16 kHz, and that preparing NumPy/tensor inputs into this
+    format is the caller's responsibility. This adapter performs explicit
+    mono-conversion and resampling via torchaudio before calling
+    transcribe(), matching the ParakeetAdapter's approach.
     """
 
     DEFAULT_MODEL_NAME = "nvidia/stt_en_fastconformer_ctc_large"
+    TARGET_SAMPLE_RATE = 16000
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
@@ -90,6 +98,37 @@ class NeMoFastConformerAdapter(BaseAdapter):
 
         print(f"NeMo FastConformer loaded on device: {self.device}")
 
+    def _load_and_prepare_audio(self, audio_path: Path):
+        """Load audio, convert to mono, and resample to 16 kHz.
+
+        Returns (waveform_1d_float32_numpy, original_sample_rate, duration_s).
+        """
+
+        try:
+            waveform, original_sample_rate = torchaudio.load(str(audio_path))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load audio file '{audio_path}': {exc}"
+            ) from exc
+
+        if waveform.numel() == 0:
+            raise ValueError(f"Audio file is empty: {audio_path}")
+
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        if original_sample_rate != self.TARGET_SAMPLE_RATE:
+            waveform = torchaudio.functional.resample(
+                waveform,
+                orig_freq=original_sample_rate,
+                new_freq=self.TARGET_SAMPLE_RATE,
+            )
+
+        waveform = waveform.squeeze(0).to(torch.float32)
+        duration_s = waveform.shape[-1] / self.TARGET_SAMPLE_RATE
+
+        return waveform.numpy(), original_sample_rate, duration_s
+
     def transcribe(self, audio_path: Union[str, Path]) -> Dict[str, Any]:
         """Transcribe one audio file and measure end-to-end latency."""
 
@@ -103,23 +142,29 @@ class NeMoFastConformerAdapter(BaseAdapter):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
+        waveform, original_sample_rate, duration_s = self._load_and_prepare_audio(audio_path)
+
         with torch.inference_mode():
             outputs = self.model.transcribe(
-                audio=[str(audio_path)],
+                audio=[waveform],
                 batch_size=self.batch_size,
                 verbose=False,
             )
 
         if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=self.device)
 
         latency_ms = (time.perf_counter() - start_time) * 1000.0
 
         text = self._extract_text(outputs)
+
+        real_time_factor = (
+            (latency_ms / 1000) / duration_s if duration_s > 0 else None
+        )
 
         return {
             "text": text,
@@ -131,6 +176,16 @@ class NeMoFastConformerAdapter(BaseAdapter):
                 "device": self.device,
                 "batch_size": self.batch_size,
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
+                "original_sample_rate": original_sample_rate,
+                "target_sample_rate": self.TARGET_SAMPLE_RATE,
+                "audio_duration_s": duration_s,
+                "real_time_factor": real_time_factor,
+                "preprocessing_steps": [
+                    "torchaudio_load",
+                    "mono_conversion",
+                    "resampling_to_16khz",
+                ],
             },
         }
 
