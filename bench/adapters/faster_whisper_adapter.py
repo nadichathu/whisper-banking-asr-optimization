@@ -1,5 +1,4 @@
 import gc
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -12,7 +11,7 @@ from bench.config import DEVICE, MODEL_SIZE
 
 
 class FasterWhisperAdapter(BaseAdapter):
-    """Non-quantized Faster-Whisper/CTranslate2 baseline.
+    """Non-quantized Faster-Whisper/CTranslate2 baseline. GPU-only.
 
     This adapter provides the correct comparison baseline for:
 
@@ -20,18 +19,13 @@ class FasterWhisperAdapter(BaseAdapter):
 
     The intended isolated comparison is:
 
-        FasterWhisperAdapter
-            CPU:  compute_type="float32"
-            CUDA: compute_type="float16"
-
+        FasterWhisperAdapter (compute_type="float16")
         versus
-
-        WhisperINT8Adapter
-            CPU:  compute_type="int8"
-            CUDA: compute_type="int8_float16"
+        WhisperINT8Adapter (compute_type="int8_float16")
 
     All transcription and decoding parameters must remain identical between
-    these two adapters. Only ``compute_type`` should differ.
+    these two adapters. Only ``compute_type`` should differ. See
+    WhisperINT8Adapter for the exact same parameter set.
 
     When compared directly with OpenAI Whisper, this adapter measures an
     implementation/backend change rather than quantisation alone.
@@ -56,7 +50,6 @@ class FasterWhisperAdapter(BaseAdapter):
     ) -> None:
         super().__init__(config)
 
-        self.config = config or {}
         self.name = "faster_whisper"
 
         self.model_size = str(
@@ -78,31 +71,16 @@ class FasterWhisperAdapter(BaseAdapter):
             self.device_index,
         ) = self._resolve_device(requested_device)
 
-        if self.device == "cuda":
-            default_compute_type = "float16"
-            default_cpu_threads = 0
-        else:
-            default_compute_type = "float32"
-            default_cpu_threads = max(
-                1,
-                os.cpu_count() or 1,
-            )
-
         self.compute_type = str(
             self.config.get(
                 "compute_type",
-                default_compute_type,
+                "float16",
             )
         ).lower()
 
         self._validate_compute_type()
 
-        self.cpu_threads = int(
-            self.config.get(
-                "cpu_threads",
-                default_cpu_threads,
-            )
-        )
+        self.cpu_threads = 0
 
         self.num_workers = int(
             self.config.get(
@@ -110,11 +88,6 @@ class FasterWhisperAdapter(BaseAdapter):
                 1,
             )
         )
-
-        if self.cpu_threads < 0:
-            raise ValueError(
-                "cpu_threads cannot be negative."
-            )
 
         if self.num_workers <= 0:
             raise ValueError(
@@ -258,8 +231,9 @@ class FasterWhisperAdapter(BaseAdapter):
     @staticmethod
     def _resolve_device(
         requested_device: str,
-    ) -> Tuple[str, Union[int, list[int]]]:
-        """Resolve the CTranslate2 device and CUDA device index.
+    ) -> Tuple[str, int]:
+        """Resolve the CTranslate2 device and CUDA device index. GPU-only:
+        no CPU fallback.
 
         Faster-Whisper expects:
 
@@ -269,54 +243,50 @@ class FasterWhisperAdapter(BaseAdapter):
         rather than a PyTorch-style device string such as ``cuda:0``.
         """
 
-        if requested_device.startswith("cuda"):
-            if not torch.cuda.is_available():
-                print(
-                    "CUDA was requested but is unavailable. "
-                    "Falling back to CPU."
-                )
-                return "cpu", 0
+        if not requested_device.startswith("cuda"):
+            raise ValueError(
+                "This benchmark suite is GPU-only. "
+                f"Received device='{requested_device}'. "
+                "Use 'cuda' or an indexed value such as 'cuda:0'."
+            )
 
-            if ":" in requested_device:
-                index_text = requested_device.split(
-                    ":",
-                    maxsplit=1,
-                )[1]
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but no CUDA-compatible GPU "
+                "is available in the current environment."
+            )
 
-                try:
-                    device_index = int(index_text)
-                except ValueError as exc:
-                    raise ValueError(
-                        "Invalid CUDA device value: "
-                        f"{requested_device}. Use 'cuda' "
-                        "or an indexed value such as 'cuda:0'."
-                    ) from exc
-            else:
-                device_index = 0
+        if ":" in requested_device:
+            index_text = requested_device.split(
+                ":",
+                maxsplit=1,
+            )[1]
 
-            if device_index < 0:
+            try:
+                device_index = int(index_text)
+            except ValueError as exc:
                 raise ValueError(
-                    "CUDA device index cannot be negative."
-                )
+                    "Invalid CUDA device value: "
+                    f"{requested_device}. Use 'cuda' "
+                    "or an indexed value such as 'cuda:0'."
+                ) from exc
+        else:
+            device_index = 0
 
-            available_devices = torch.cuda.device_count()
+        if device_index < 0:
+            raise ValueError(
+                "CUDA device index cannot be negative."
+            )
 
-            if device_index >= available_devices:
-                raise ValueError(
-                    f"CUDA device index {device_index} is unavailable. "
-                    f"Detected {available_devices} CUDA device(s)."
-                )
+        available_devices = torch.cuda.device_count()
 
-            return "cuda", device_index
+        if device_index >= available_devices:
+            raise ValueError(
+                f"CUDA device index {device_index} is unavailable. "
+                f"Detected {available_devices} CUDA device(s)."
+            )
 
-        if requested_device == "cpu":
-            return "cpu", 0
-
-        raise ValueError(
-            f"Unsupported device: {requested_device}. "
-            "Use 'cpu', 'cuda', or an indexed CUDA device "
-            "such as 'cuda:0'."
-        )
+        return "cuda", device_index
 
     def _validate_compute_type(self) -> None:
         """Prevent accidental use of an INT8 configuration.
@@ -326,40 +296,24 @@ class FasterWhisperAdapter(BaseAdapter):
         """
 
         valid_compute_types = {
-            "float32",
             "float16",
             "bfloat16",
         }
 
         if self.compute_type not in valid_compute_types:
             raise ValueError(
-                "FasterWhisperAdapter requires a non-INT8 "
-                "compute type. Supported values are: "
+                "FasterWhisperAdapter (GPU-only) requires a non-INT8 "
+                "GPU compute type. Supported values are: "
                 f"{sorted(valid_compute_types)}. "
                 f"Received: {self.compute_type}. "
                 "Use WhisperINT8Adapter for INT8 experiments."
-            )
-
-        if (
-            self.device == "cpu"
-            and self.compute_type == "float16"
-        ):
-            raise ValueError(
-                "compute_type='float16' is not an appropriate "
-                "explicit CPU configuration for this benchmark. "
-                "Use 'float32' on CPU."
             )
 
     def load(self) -> WhisperModel:
         """Load the Faster-Whisper CTranslate2 model."""
 
         if self._model is None:
-            device_description = self.device
-
-            if self.device == "cuda":
-                device_description = (
-                    f"{self.device}:{self.device_index}"
-                )
+            device_description = f"{self.device}:{self.device_index}"
 
             print(
                 f"Loading Faster-Whisper {self.model_size} "
@@ -404,10 +358,9 @@ class FasterWhisperAdapter(BaseAdapter):
                 f"Audio path is not a file: {audio_path}"
             )
 
-        if self.device == "cuda":
-            torch.cuda.synchronize(
-                self.device_index
-            )
+        torch.cuda.synchronize(
+            self.device_index
+        )
 
         start_time = time.perf_counter()
 
@@ -450,10 +403,9 @@ class FasterWhisperAdapter(BaseAdapter):
             segments_generator
         )
 
-        if self.device == "cuda":
-            torch.cuda.synchronize(
-                self.device_index
-            )
+        torch.cuda.synchronize(
+            self.device_index
+        )
 
         latency_ms = (
             time.perf_counter() - start_time
@@ -534,11 +486,7 @@ class FasterWhisperAdapter(BaseAdapter):
                 ),
                 "model_size": self.model_size,
                 "device": self.device,
-                "device_index": (
-                    self.device_index
-                    if self.device == "cuda"
-                    else None
-                ),
+                "device_index": self.device_index,
                 "compute_type": self.compute_type,
                 "quantization": "none",
                 "precision": self.compute_type,
@@ -601,9 +549,9 @@ class FasterWhisperAdapter(BaseAdapter):
                     else None
                 ),
                 "real_time_factor": real_time_factor,
-                "cpu_threads": self.cpu_threads,
                 "num_workers": self.num_workers,
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
                 "latency_includes": [
                     "audio_loading",
                     "audio_decoding",
@@ -631,11 +579,8 @@ class FasterWhisperAdapter(BaseAdapter):
     def close(self) -> None:
         """Release Faster-Whisper and CTranslate2 resources."""
 
-        used_cuda = self.device == "cuda"
-
         self._model = None
 
         gc.collect()
 
-        if used_cuda:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
