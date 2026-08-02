@@ -24,35 +24,31 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
 
     The complete file-to-text pipeline is included in the reported latency.
 
-    Unlike the previous implementation, this adapter does not additionally:
-
-        - limit decoder tokens
-        - disable timestamp tokens
-        - disable previous-text conditioning
-        - change precision to FP16
-        - permanently force a single greedy attempt
-
     The standard Whisper temperature-fallback sequence and quality
-    thresholds are reproduced manually because ``whisper.decode()`` performs
-    only one decoding attempt per call.
+    thresholds are reproduced manually, matching OpenAI's actual
+    decode_with_fallback() implementation in transcribe.py:
+
+        - compression_ratio_threshold and logprob_threshold each
+          independently trigger fallback to the next temperature;
+        - no_speech_threshold, if exceeded, unconditionally overrides
+          and cancels fallback (treats the segment as silence and stops
+          escalating temperature), regardless of the other two checks.
+
+    Note on encoder cost: whisper.decode() recomputes the encoder on
+    every call, because it is a stateless single-shot API that always
+    encodes whatever mel tensor it is given. Critically, OpenAI's own
+    high-level transcribe() ALSO calls model.decode() fresh for each
+    fallback temperature attempt (see decode_with_fallback() in
+    transcribe.py) -- it does not cache or reuse encoder output across
+    attempts either. So repeated encoder computation on fallback is not
+    an extra cost specific to this adapter; it is present in both
+    transcribe() and decode()-based pipelines equally.
 
     Research limitation:
     Direct decoding operates on one padded or trimmed 30-second window. It
     does not reproduce the complete long-audio segmentation and context
     management performed by ``model.transcribe()``. This is acceptable for
     short banking commands but must be documented in the methodology.
-
-    Research limitation (encoder cost on fallback):
-    ``whisper.decode()`` recomputes the encoder on every call, since the
-    public API provides no way to reuse a precomputed encoder output across
-    calls. Whisper's internal ``transcribe()`` pipeline, by contrast,
-    computes the encoder once and reuses it across every temperature
-    attempt in its fallback loop. Consequently, on any file where fallback
-    actually triggers (see ``fallback_used`` in the returned metadata),
-    this adapter pays for one additional full encoder pass per extra
-    temperature attempt -- a cost that is specific to this adapter's API
-    choice, not to the direct-decode technique in general, and that
-    inflates latency only on fallback-triggering files.
     """
 
     DEFAULT_TEMPERATURES = (
@@ -180,7 +176,8 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
         self,
         mel: torch.Tensor,
     ):
-        """Decode one mel window using Whisper-style fallback logic.
+        """Decode one mel window using Whisper-style fallback logic,
+        matching OpenAI's actual decode_with_fallback() in transcribe.py.
 
         Returns:
             A tuple containing:
@@ -189,11 +186,13 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             - temperatures attempted
             - whether fallback occurred
             - reason that requested the final fallback
+            - whether the no-speech override cancelled fallback
         """
 
         selected_result = None
         temperatures_attempted = []
         final_fallback_reason = None
+        no_speech_override_used = False
 
         for temperature in self.temperatures:
             temperatures_attempted.append(
@@ -224,6 +223,11 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
 
             selected_result = result
 
+            # Matches OpenAI's needs_fallback logic exactly:
+            # compression_ratio and logprob each independently trigger
+            # fallback; no_speech_threshold, if exceeded, unconditionally
+            # cancels fallback regardless of the other two checks.
+            needs_fallback = False
             fallback_reasons = []
 
             if (
@@ -231,26 +235,40 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 and result.compression_ratio
                 > self.compression_ratio_threshold
             ):
-                fallback_reasons.append(
-                    "compression_ratio"
-                )
+                needs_fallback = True
+                fallback_reasons.append("compression_ratio")
 
             if (
                 self.logprob_threshold is not None
                 and result.avg_logprob
                 < self.logprob_threshold
             ):
-                fallback_reasons.append(
-                    "average_log_probability"
-                )
+                needs_fallback = True
+                fallback_reasons.append("average_log_probability")
 
-            if not fallback_reasons:
-                final_fallback_reason = None
+            this_attempt_no_speech_override = False
+
+            if (
+                self.no_speech_threshold is not None
+                and result.no_speech_prob
+                > self.no_speech_threshold
+            ):
+                # Unconditional override, matching OpenAI's source
+                # exactly: treat as silence and stop escalating
+                # temperature, regardless of the two checks above.
+                needs_fallback = False
+                this_attempt_no_speech_override = True
+
+            if not needs_fallback:
+                no_speech_override_used = this_attempt_no_speech_override
+                final_fallback_reason = (
+                    None
+                    if not fallback_reasons or this_attempt_no_speech_override
+                    else ",".join(fallback_reasons)
+                )
                 break
 
-            final_fallback_reason = ",".join(
-                fallback_reasons
-            )
+            final_fallback_reason = ",".join(fallback_reasons)
 
         if selected_result is None:
             raise RuntimeError(
@@ -266,6 +284,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             temperatures_attempted,
             fallback_used,
             final_fallback_reason,
+            no_speech_override_used,
         )
 
     def transcribe(
@@ -372,6 +391,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             temperatures_attempted,
             fallback_used,
             final_fallback_reason,
+            no_speech_override_used,
         ) = self._decode_with_fallback(
             mel
         )
@@ -400,6 +420,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             ):
                 no_speech_detected = False
 
+        # Text extraction included inside the timed region.
         text = (
             ""
             if no_speech_detected
@@ -454,6 +475,9 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 "fallback_used": fallback_used,
                 "final_fallback_reason": (
                     final_fallback_reason
+                ),
+                "no_speech_override_used": (
+                    no_speech_override_used
                 ),
                 "compression_ratio_threshold": (
                     self.compression_ratio_threshold
@@ -510,19 +534,11 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                     "Direct decode processes one padded or "
                     "trimmed 30-second window and does not "
                     "replicate transcribe() long-audio "
-                    "segmentation or context propagation."
-                ),
-                "fallback_encoder_recompute_note": (
-                    "whisper.decode() recomputes the encoder on "
-                    "every call, unlike transcribe()'s internal "
-                    "pipeline which reuses one encoder pass across "
-                    "all fallback attempts. On files where "
-                    "fallback_used is True, this adapter's latency "
-                    "includes one additional full encoder pass per "
-                    "extra temperature attempt, a cost specific to "
-                    "this adapter's use of the low-level decode() "
-                    "API rather than to the direct-decode technique "
-                    "in general."
+                    "segmentation or context propagation. "
+                    "Encoder recomputation on fallback is NOT an "
+                    "extra cost specific to this adapter: OpenAI's "
+                    "own transcribe() also recomputes the encoder "
+                    "on every fallback attempt via model.decode()."
                 ),
             },
         }
