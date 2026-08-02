@@ -415,16 +415,19 @@ class WhisperINT8Adapter(BaseAdapter):
             self.device_index
         )
 
-        latency_ms = (
-            time.perf_counter() - start_time
-        ) * 1000
-
+        # Text assembly is included inside the timed region so that
+        # latency genuinely reflects file-to-final-text, matching the
+        # text_assembly entry in latency_includes below.
         text = " ".join(
             segment.text.strip()
             for segment in segments
             if segment.text
             and segment.text.strip()
         ).strip()
+
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
 
         generated_token_count = sum(
             len(segment.tokens)
