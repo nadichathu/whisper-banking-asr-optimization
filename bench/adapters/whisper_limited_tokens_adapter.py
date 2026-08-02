@@ -11,7 +11,7 @@ from bench.config import DEVICE, MODEL_SIZE
 
 
 class WhisperLimitedTokensAdapter(BaseAdapter):
-    """OpenAI Whisper with a limited decoder output length.
+    """OpenAI Whisper with a limited decoder output length. GPU-only.
 
     Experimental change relative to the FP32 Whisper baseline:
 
@@ -32,7 +32,6 @@ class WhisperLimitedTokensAdapter(BaseAdapter):
     ):
         super().__init__(config)
 
-        self.config = config or {}
         self.name = "whisper_limited_tokens"
 
         self.model_size = self.config.get(
@@ -59,17 +58,20 @@ class WhisperLimitedTokensAdapter(BaseAdapter):
             )
         ).lower()
 
-        if requested_device.startswith("cuda"):
-            if torch.cuda.is_available():
-                self.device = requested_device
-            else:
-                print(
-                    "CUDA was requested but is unavailable. "
-                    "Falling back to CPU."
-                )
-                self.device = "cpu"
-        else:
-            self.device = "cpu"
+        if not requested_device.startswith("cuda"):
+            raise ValueError(
+                "This benchmark suite is GPU-only. "
+                f"Received device='{requested_device}'. "
+                "Run with '--device cuda' or '--device cuda:0'."
+            )
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but no CUDA-compatible GPU "
+                "is available in the current environment."
+            )
+
+        self.device = requested_device
 
         self._model = None
 
@@ -115,8 +117,7 @@ class WhisperLimitedTokensAdapter(BaseAdapter):
                 f"Audio path is not a file: {audio_path}"
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+        torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
@@ -141,8 +142,7 @@ class WhisperLimitedTokensAdapter(BaseAdapter):
             # This preserves Whisper's baseline defaults.
         )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+        torch.cuda.synchronize(device=self.device)
 
         latency_ms = (
             time.perf_counter() - start_time
@@ -196,6 +196,7 @@ class WhisperLimitedTokensAdapter(BaseAdapter):
                 "temperature_fallback_enabled": True,
 
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
                 "latency_includes": [
                     "audio_loading",
                     "audio_decoding",
@@ -214,11 +215,8 @@ class WhisperLimitedTokensAdapter(BaseAdapter):
     def close(self) -> None:
         """Release Whisper model resources."""
 
-        used_cuda = self.device.startswith("cuda")
-
         self._model = None
 
         gc.collect()
 
-        if used_cuda:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
