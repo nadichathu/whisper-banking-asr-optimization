@@ -11,7 +11,7 @@ from bench.config import DEVICE, MODEL_SIZE
 
 
 class WhisperAdapter(BaseAdapter):
-    """OpenAI Whisper FP32 baseline adapter.
+    """OpenAI Whisper FP32 baseline adapter. GPU-only.
 
     The reported latency is end-to-end file-to-text latency and includes
     Whisper's internal audio loading, resampling, preprocessing, inference,
@@ -27,7 +27,6 @@ class WhisperAdapter(BaseAdapter):
     ):
         super().__init__(config)
 
-        self.config = config or {}
         self.name = "whisper"
 
         self.model_size = self.config.get(
@@ -39,18 +38,20 @@ class WhisperAdapter(BaseAdapter):
             self.config.get("device", DEVICE)
         ).lower()
 
-        if requested_device.startswith("cuda"):
-            if torch.cuda.is_available():
-                self.device = requested_device
-            else:
-                print(
-                    "CUDA was requested but is unavailable. "
-                    "Falling back to CPU."
-                )
-                self.device = "cpu"
-        else:
-            self.device = "cpu"
+        if not requested_device.startswith("cuda"):
+            raise ValueError(
+                "This benchmark suite is GPU-only. "
+                f"Received device='{requested_device}'. "
+                "Run with '--device cuda' or '--device cuda:0'."
+            )
 
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but no CUDA-compatible GPU "
+                "is available in the current environment."
+            )
+
+        self.device = requested_device
         self._model = None
 
     def load(self):
@@ -90,8 +91,7 @@ class WhisperAdapter(BaseAdapter):
                 f"Audio file was not found: {audio_path}"
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         start_time = time.perf_counter()
 
@@ -102,8 +102,7 @@ class WhisperAdapter(BaseAdapter):
             fp16=False,
         )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         latency_ms = (
             time.perf_counter() - start_time
@@ -126,6 +125,7 @@ class WhisperAdapter(BaseAdapter):
                 "decoding": "default_transcribe",
                 "language": "en",
                 "latency_type": "end_to_end",
+                "model_loading_included": False,
                 "latency_includes": [
                     "audio_loading",
                     "audio_resampling",
@@ -169,8 +169,7 @@ class WhisperAdapter(BaseAdapter):
                 f"Audio file was not found: {audio_path}"
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         profiling_start = time.perf_counter()
 
@@ -201,8 +200,7 @@ class WhisperAdapter(BaseAdapter):
             n_mels=self._model.dims.n_mels,
         ).to(self.device)
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         mel_ms = (
             time.perf_counter() - stage_start
@@ -215,8 +213,7 @@ class WhisperAdapter(BaseAdapter):
                 mel.unsqueeze(0)
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         encoder_ms = (
             time.perf_counter() - stage_start
@@ -237,8 +234,7 @@ class WhisperAdapter(BaseAdapter):
                 decoding_options,
             )
 
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(device=self.device)
 
         decode_pipeline_ms = (
             time.perf_counter() - stage_start
@@ -268,11 +264,8 @@ class WhisperAdapter(BaseAdapter):
     def close(self) -> None:
         """Release Whisper model resources."""
 
-        used_cuda = self.device.startswith("cuda")
-
         self._model = None
 
         gc.collect()
 
-        if used_cuda:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
