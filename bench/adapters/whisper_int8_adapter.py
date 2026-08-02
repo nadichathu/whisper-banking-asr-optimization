@@ -153,6 +153,14 @@ class WhisperINT8Adapter(BaseAdapter):
                 "At least one decoding temperature is required."
             )
 
+        if any(
+            temperature < 0.0
+            for temperature in self.temperatures
+        ):
+            raise ValueError(
+                "Decoding temperatures cannot be negative."
+            )
+
         self.beam_size = int(
             self.config.get(
                 "beam_size",
