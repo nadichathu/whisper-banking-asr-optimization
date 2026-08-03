@@ -14,19 +14,22 @@ from bench.config import PARAKEET_MODEL_ID
 
 
 class ParakeetAdapter(BaseAdapter):
-    """NVIDIA Parakeet (FastConformer-TDT) ASR adapter using NVIDIA NeMo.
-    GPU-only.
+    """NVIDIA Parakeet FastConformer-TDT ASR adapter.
 
-    Used as an external comparator model during the model-selection phase
-    (alongside Wav2Vec2 and NeMoFastConformerAdapter), not as a subject of
-    the Whisper inference-time optimisation experiments.
+    This is a GPU-only external comparator used during the ASR
+    model-selection phase. It is not a Whisper optimisation adapter.
 
-    NVIDIA's documentation states that NeMo transcription inputs must be
-    mono and 16 kHz, and that preparing NumPy/tensor inputs into this
-    format is the caller's responsibility. This adapter performs explicit
-    mono-conversion and resampling via torchaudio before calling
-    transcribe(), and cross-checks the loaded checkpoint's own configured
-    preprocessor sample rate against the target rate in load().
+    Audio preprocessing includes:
+
+    - Loading with torchaudio
+    - Validation
+    - Multichannel-to-mono conversion
+    - Resampling to 16 kHz
+    - Conversion to a contiguous float32 NumPy array
+
+    CUDA-graph decoding is disabled because the current RunPod
+    CUDA-driver environment raises CUDA error 35 while NeMo attempts
+    to compile the TDT CUDA graph.
     """
 
     TARGET_SAMPLE_RATE = 16000
@@ -42,23 +45,33 @@ class ParakeetAdapter(BaseAdapter):
             PARAKEET_MODEL_ID,
         )
 
-        requested_device_str = str(
-            self.config.get("device", "cuda")
+        requested_device = str(
+            self.config.get(
+                "device",
+                "cuda",
+            )
         ).lower().strip()
 
-        self.device = self._validate_device(requested_device_str)
+        self.device = self._validate_device(
+            requested_device
+        )
 
         self.batch_size = int(
-            self.config.get("batch_size", 1)
+            self.config.get(
+                "batch_size",
+                1,
+            )
         )
 
         if self.batch_size <= 0:
-            raise ValueError("batch_size must be greater than zero.")
+            raise ValueError(
+                "batch_size must be greater than zero."
+            )
 
         self.model = None
         self._parameter_count: Optional[int] = None
+        self._cuda_graphs_disabled = False
 
-        # Used by the runner for result filenames.
         self.name = (
             self.model_id
             .replace("/", "_")
@@ -67,37 +80,57 @@ class ParakeetAdapter(BaseAdapter):
         )
 
     @staticmethod
-    def _validate_device(requested_device: str) -> str:
-        """Validate the requested device. GPU-only: no CPU fallback."""
+    def _validate_device(
+        requested_device: str,
+    ) -> str:
+        """Validate the requested GPU device."""
 
-        if not requested_device.startswith("cuda"):
+        try:
+            device = torch.device(
+                requested_device
+            )
+        except (RuntimeError, ValueError) as exc:
             raise ValueError(
-                "This benchmark suite is GPU-only. "
+                f"Invalid device value: "
+                f"'{requested_device}'."
+            ) from exc
+
+        if device.type != "cuda":
+            raise ValueError(
+                "ParakeetAdapter is GPU-only. "
                 f"Received device='{requested_device}'. "
-                "Run with '--device cuda' or '--device cuda:0'."
+                "Use '--device cuda' or '--device cuda:0'."
             )
 
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "CUDA was requested, but no CUDA-compatible GPU "
-                "is available in the current environment."
+                "CUDA was requested, but no CUDA-compatible "
+                "GPU is available."
             )
 
-        device = torch.device(requested_device)
+        device_index = (
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        )
 
-        if device.index is not None and device.index >= torch.cuda.device_count():
+        if (
+            device_index < 0
+            or device_index >= torch.cuda.device_count()
+        ):
             raise ValueError(
-                f"CUDA device index {device.index} is unavailable. "
-                f"Detected {torch.cuda.device_count()} CUDA device(s)."
+                f"CUDA device index {device_index} is "
+                f"unavailable. Detected "
+                f"{torch.cuda.device_count()} CUDA device(s)."
             )
 
-        return str(device)
+        return f"cuda:{device_index}"
 
-    def load(self) -> None:
-        """Load the pretrained Parakeet model."""
+    def load(self):
+        """Load and prepare the pretrained Parakeet model."""
 
         if self.model is not None:
-            return
+            return self.model
 
         try:
             import nemo.collections.asr as nemo_asr
@@ -107,123 +140,211 @@ class ParakeetAdapter(BaseAdapter):
                 'pip install "nemo_toolkit[asr]"'
             ) from exc
 
-        print(f"Loading Parakeet model: {self.model_id}")
+        print(
+            f"Loading Parakeet model: {self.model_id}"
+        )
 
-        self.model = nemo_asr.models.ASRModel.from_pretrained(
-            model_name=self.model_id
+        self.model = (
+            nemo_asr.models.ASRModel.from_pretrained(
+                model_name=self.model_id
+            )
+        )
+
+        self.model = self.model.to(
+            self.device
         )
 
         self.model.eval()
 
-        # Use .to(device) rather than .cuda()/.cpu() so a specific CUDA
-        # index (e.g. "cuda:1") is respected, matching the device-selection
-        # contract used by the rest of the adapter suite.
-        self.model = self.model.to(self.device)
-
-        # Cross-check the loaded checkpoint's own configured preprocessor
-        # sample rate against TARGET_SAMPLE_RATE. Wrapped defensively:
-        # the exact config path can vary slightly across NeMo model
-        # classes/versions, and a missing attribute here should not crash
-        # load() outright -- it should be reported, not silently ignored.
-        try:
-            configured_sample_rate = int(self.model.cfg.preprocessor.sample_rate)
-            if configured_sample_rate != self.TARGET_SAMPLE_RATE:
-                raise RuntimeError(
-                    "Model preprocessing sample rate mismatch: "
-                    f"adapter targets {self.TARGET_SAMPLE_RATE} Hz, "
-                    f"but the loaded checkpoint's preprocessor is "
-                    f"configured for {configured_sample_rate} Hz. "
-                    "Update TARGET_SAMPLE_RATE or use a different checkpoint."
-                )
-        except AttributeError:
-            print(
-                "WARNING: could not read model.cfg.preprocessor.sample_rate "
-                "to verify the checkpoint's expected sample rate; proceeding "
-                f"with the configured TARGET_SAMPLE_RATE={self.TARGET_SAMPLE_RATE}."
+        # NeMo TDT decoding can attempt to compile CUDA graphs.
+        # The current RunPod driver/runtime combination raises
+        # cudaErrorInsufficientDriver during that compilation.
+        # Disable CUDA graphs and use standard GPU decoding.
+        if not hasattr(
+            self.model,
+            "disable_cuda_graphs",
+        ):
+            raise RuntimeError(
+                "The installed NeMo model does not expose "
+                "disable_cuda_graphs(). Check the installed "
+                "nemo_toolkit version before benchmarking."
             )
 
-        # Parameter count computed once here, not per-transcribe() call,
-        # so it never adds overhead inside the timed region.
         try:
-            self._parameter_count = sum(p.numel() for p in self.model.parameters())
+            self.model.disable_cuda_graphs()
+            self._cuda_graphs_disabled = True
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to disable CUDA-graph decoding for "
+                f"Parakeet model '{self.model_id}': {exc}"
+            ) from exc
+
+        # Confirm that the checkpoint expects the same sample
+        # rate used by this adapter.
+        try:
+            configured_sample_rate = int(
+                self.model.cfg.preprocessor.sample_rate
+            )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise RuntimeError(
+                "Could not verify the Parakeet model's "
+                "configured preprocessing sample rate."
+            ) from exc
+
+        if (
+            configured_sample_rate
+            != self.TARGET_SAMPLE_RATE
+        ):
+            raise RuntimeError(
+                "Model preprocessing sample-rate mismatch: "
+                f"adapter={self.TARGET_SAMPLE_RATE} Hz, "
+                f"checkpoint={configured_sample_rate} Hz."
+            )
+
+        try:
+            self._parameter_count = sum(
+                parameter.numel()
+                for parameter
+                in self.model.parameters()
+            )
         except Exception:
             self._parameter_count = None
 
-        print(f"Parakeet loaded on device: {self.device}")
+        print(
+            f"Parakeet loaded on device: {self.device}"
+        )
+
+        print(
+            "Parakeet CUDA-graph decoding disabled; "
+            "using standard GPU decoding."
+        )
+
+        return self.model
 
     def _load_and_prepare_audio(
         self,
         audio_path: pathlib.Path,
-    ):
-        """Load audio, convert to mono, and resample to 16 kHz.
+    ) -> tuple[np.ndarray, int, int, float]:
+        """Load, validate, mono-convert and resample audio.
 
-        Returns (waveform_1d_float32_numpy, original_sample_rate,
-        original_channels, duration_s), where duration_s is computed from
-        the ORIGINAL (pre-resample) sample count, since resampling can
-        introduce small rounding differences in sample count.
+        Returns:
+            waveform:
+                Contiguous one-dimensional float32 NumPy array.
+            original_sample_rate:
+                Sample rate stored in the source audio file.
+            original_channels:
+                Channel count before mono conversion.
+            duration_s:
+                Duration calculated from the original audio.
         """
 
         try:
-            waveform, original_sample_rate = torchaudio.load(str(audio_path))
+            (
+                waveform,
+                original_sample_rate,
+            ) = torchaudio.load(
+                str(audio_path)
+            )
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to load audio file '{audio_path}': {exc}"
+                f"Failed to load audio file "
+                f"'{audio_path}': {exc}"
             ) from exc
 
         if waveform.ndim != 2:
             raise ValueError(
-                "Expected waveform with shape [channels, samples], "
-                f"received {tuple(waveform.shape)}."
+                "Expected waveform shape "
+                "[channels, samples], but received "
+                f"{tuple(waveform.shape)}."
             )
 
         if waveform.numel() == 0:
-            raise ValueError(f"Audio file is empty: {audio_path}")
+            raise ValueError(
+                f"Audio file is empty: {audio_path}"
+            )
 
         if original_sample_rate <= 0:
-            raise ValueError(f"Invalid sample rate: {original_sample_rate}")
-
-        if not torch.isfinite(waveform).all():
             raise ValueError(
-                f"Audio contains NaN or infinite values: {audio_path}"
+                "Invalid source-audio sample rate: "
+                f"{original_sample_rate}"
             )
 
-        original_channels = int(waveform.shape[0])
-        original_num_samples = int(waveform.shape[-1])
-        duration_s = original_num_samples / float(original_sample_rate)
-
-        # Convert multi-channel audio to mono.
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-
-        # Resample to the rate NeMo expects.
-        if original_sample_rate != self.TARGET_SAMPLE_RATE:
-            waveform = torchaudio.functional.resample(
-                waveform,
-                orig_freq=original_sample_rate,
-                new_freq=self.TARGET_SAMPLE_RATE,
+        if not torch.isfinite(
+            waveform
+        ).all():
+            raise ValueError(
+                "Audio contains NaN or infinite values: "
+                f"{audio_path}"
             )
 
-        waveform = waveform.squeeze(0).to(torch.float32)
-        waveform_np = np.ascontiguousarray(
+        original_channels = int(
+            waveform.shape[0]
+        )
+
+        original_num_samples = int(
+            waveform.shape[-1]
+        )
+
+        duration_s = (
+            original_num_samples
+            / float(original_sample_rate)
+        )
+
+        if original_channels > 1:
+            waveform = waveform.mean(
+                dim=0,
+                keepdim=True,
+            )
+
+        if (
+            original_sample_rate
+            != self.TARGET_SAMPLE_RATE
+        ):
+            waveform = (
+                torchaudio.functional.resample(
+                    waveform,
+                    orig_freq=original_sample_rate,
+                    new_freq=self.TARGET_SAMPLE_RATE,
+                )
+            )
+
+        waveform = (
+            waveform
+            .squeeze(0)
+            .to(torch.float32)
+        )
+
+        waveform_numpy = np.ascontiguousarray(
             waveform.detach().cpu().numpy(),
             dtype=np.float32,
         )
 
-        return waveform_np, original_sample_rate, original_channels, duration_s
+        return (
+            waveform_numpy,
+            original_sample_rate,
+            original_channels,
+            duration_s,
+        )
 
     def transcribe(
         self,
         audio_path: pathlib.Path,
     ) -> Dict[str, Any]:
-        """Transcribe one audio file and measure end-to-end latency."""
+        """Transcribe one file and measure end-to-end latency."""
 
         if self.model is None:
             raise RuntimeError(
-                "Parakeet model has not been loaded. "
+                "Parakeet model is not loaded. "
                 "Call load() before transcribe()."
             )
 
-        audio_path = pathlib.Path(audio_path)
+        audio_path = pathlib.Path(
+            audio_path
+        )
 
         if not audio_path.exists():
             raise FileNotFoundError(
@@ -231,14 +352,23 @@ class ParakeetAdapter(BaseAdapter):
             )
 
         if not audio_path.is_file():
-            raise ValueError(f"Audio path is not a file: {audio_path}")
+            raise ValueError(
+                f"Audio path is not a file: {audio_path}"
+            )
 
-        torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(
+            device=self.device
+        )
 
         start_time = time.perf_counter()
 
-        waveform, original_sample_rate, original_channels, duration_s = (
-            self._load_and_prepare_audio(audio_path)
+        (
+            waveform,
+            original_sample_rate,
+            original_channels,
+            duration_s,
+        ) = self._load_and_prepare_audio(
+            audio_path
         )
 
         with torch.inference_mode():
@@ -248,18 +378,24 @@ class ParakeetAdapter(BaseAdapter):
                 verbose=False,
             )
 
-        torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(
+            device=self.device
+        )
 
-        # Text extraction included inside the timed region, so latency
-        # reflects file-to-final-text, not file-to-raw-model-output.
-        text = self._extract_text(outputs)
+        # Include final text extraction in the timed region.
+        text = self._extract_text(
+            outputs
+        )
 
         latency_ms = (
-            time.perf_counter() - start_time
+            time.perf_counter()
+            - start_time
         ) * 1000.0
 
         real_time_factor = (
-            (latency_ms / 1000) / duration_s if duration_s > 0 else None
+            (latency_ms / 1000.0) / duration_s
+            if duration_s > 0
+            else None
         )
 
         return {
@@ -269,21 +405,39 @@ class ParakeetAdapter(BaseAdapter):
                 "implementation": "nemo",
                 "backend": "pytorch",
                 "model_id": self.model_id,
-                "model_class": type(self.model).__name__,
+                "model_class": (
+                    type(self.model).__name__
+                ),
                 "architecture": "FastConformer-TDT",
                 "decoder": "TDT",
                 "language": "en",
                 "device": self.device,
-                "parameter_count": self._parameter_count,
+                "parameter_count": (
+                    self._parameter_count
+                ),
                 "batch_size": self.batch_size,
+                "cuda_graphs_disabled": (
+                    self._cuda_graphs_disabled
+                ),
+                "decoding_execution": (
+                    "standard_gpu_without_cuda_graphs"
+                ),
                 "latency_type": "end_to_end",
                 "model_loading_included": False,
-                "original_channels": original_channels,
+                "original_channels": (
+                    original_channels
+                ),
                 "processed_channels": 1,
-                "original_sample_rate": original_sample_rate,
-                "target_sample_rate": self.TARGET_SAMPLE_RATE,
+                "original_sample_rate": (
+                    original_sample_rate
+                ),
+                "target_sample_rate": (
+                    self.TARGET_SAMPLE_RATE
+                ),
                 "audio_duration_s": duration_s,
-                "real_time_factor": real_time_factor,
+                "real_time_factor": (
+                    real_time_factor
+                ),
                 "preprocessing_steps": [
                     "torchaudio_load",
                     "mono_conversion",
@@ -297,21 +451,23 @@ class ParakeetAdapter(BaseAdapter):
                     "numpy_conversion",
                     "feature_extraction",
                     "encoder",
-                    "decoder",
+                    "standard_gpu_tdt_decoding",
                     "text_extraction",
                 ],
+                "environment_note": (
+                    "CUDA-graph decoding was disabled "
+                    "because CUDA graph compilation failed "
+                    "with cudaErrorInsufficientDriver in "
+                    "the RunPod environment."
+                ),
             },
         }
 
     @staticmethod
-    def _extract_text(outputs: Any) -> str:
-        """Handle different NeMo transcription return formats.
-
-        Some NeMo model/version combinations return a bare list of
-        hypotheses; others return a tuple whose first element is that
-        list (e.g. (hypotheses, other_metadata)). Unwrap the tuple case
-        before proceeding with the usual list handling.
-        """
+    def _extract_text(
+        outputs: Any,
+    ) -> str:
+        """Extract text from supported NeMo output formats."""
 
         if outputs is None:
             return ""
@@ -319,11 +475,17 @@ class ParakeetAdapter(BaseAdapter):
         if (
             isinstance(outputs, tuple)
             and len(outputs) >= 1
-            and isinstance(outputs[0], (list, tuple))
+            and isinstance(
+                outputs[0],
+                (list, tuple),
+            )
         ):
             outputs = outputs[0]
 
-        if not isinstance(outputs, (list, tuple)):
+        if not isinstance(
+            outputs,
+            (list, tuple),
+        ):
             outputs = [outputs]
 
         if not outputs:
@@ -331,34 +493,48 @@ class ParakeetAdapter(BaseAdapter):
 
         first_output = outputs[0]
 
-        # Current NeMo API normally returns a hypothesis object.
-        if hasattr(first_output, "text"):
-            return str(first_output.text or "").strip()
+        if hasattr(
+            first_output,
+            "text",
+        ):
+            return str(
+                first_output.text or ""
+            ).strip()
 
-        # Some NeMo versions may return plain strings.
-        if isinstance(first_output, str):
+        if isinstance(
+            first_output,
+            str,
+        ):
             return first_output.strip()
 
-        # Defensive support for dictionary-like output.
-        if isinstance(first_output, dict):
-            return str(first_output.get("text", "") or "").strip()
+        if isinstance(
+            first_output,
+            dict,
+        ):
+            return str(
+                first_output.get(
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
 
-        # Do not silently stringify an unrecognised object -- that could
-        # store a Python repr (e.g. "<...Hypothesis object at 0x...>")
-        # into the transcript field and corrupt downstream WER scoring
-        # without any visible error.
         raise TypeError(
             "Unsupported NeMo transcription output type: "
             f"{type(first_output).__name__}"
         )
 
     def close(self) -> None:
-        """Release model and GPU memory."""
+        """Release the model and GPU memory."""
 
         if self.model is not None:
             del self.model
             self.model = None
 
+        self._parameter_count = None
+        self._cuda_graphs_disabled = False
+
         gc.collect()
 
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
