@@ -1,7 +1,7 @@
 import gc
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import whisper
@@ -12,46 +12,41 @@ from bench.config import DEVICE, MODEL_SIZE
 
 class WhisperDirectDecodeAdapter(BaseAdapter):
     """OpenAI Whisper using the lower-level ``whisper.decode()`` API.
-    GPU-only.
 
-    Experimental approach:
+    This adapter measures a direct single-window decoding pipeline:
 
-        audio path
+        audio file
         -> whisper.load_audio()
         -> whisper.pad_or_trim()
         -> whisper.log_mel_spectrogram()
         -> whisper.decode()
+        -> final text extraction
 
     The complete file-to-text pipeline is included in the reported latency.
 
-    The standard Whisper temperature-fallback sequence and quality
-    thresholds are reproduced manually, matching OpenAI's actual
-    decode_with_fallback() implementation in transcribe.py:
+    Temperature fallback follows OpenAI Whisper's high-level transcription
+    policy as closely as possible:
 
-        - compression_ratio_threshold and logprob_threshold each
-          independently trigger fallback to the next temperature;
-        - no_speech_threshold, if exceeded, unconditionally overrides
-          and cancels fallback (treats the segment as silence and stops
-          escalating temperature), regardless of the other two checks.
+    - excessive compression ratio can trigger another temperature attempt;
+    - low average log probability can trigger another temperature attempt;
+    - likely silence cancels fallback only when both:
+        1. no-speech probability exceeds the configured threshold; and
+        2. average log probability is below the configured threshold.
 
-    Note on encoder cost: whisper.decode() recomputes the encoder on
-    every call, because it is a stateless single-shot API that always
-    encodes whatever mel tensor it is given. Critically, OpenAI's own
-    high-level transcribe() ALSO calls model.decode() fresh for each
-    fallback temperature attempt (see decode_with_fallback() in
-    transcribe.py) -- it does not cache or reuse encoder output across
-    attempts either. So repeated encoder computation on fallback is not
-    an extra cost specific to this adapter; it is present in both
-    transcribe() and decode()-based pipelines equally.
+    Each call to ``whisper.decode()`` receives a mel spectrogram and therefore
+    performs its own encoder and decoder execution. OpenAI Whisper's
+    high-level ``transcribe()`` fallback loop similarly calls the model's
+    decode operation again for each attempted temperature.
 
     Research limitation:
-    Direct decoding operates on one padded or trimmed 30-second window. It
-    does not reproduce the complete long-audio segmentation and context
-    management performed by ``model.transcribe()``. This is acceptable for
-    short banking commands but must be documented in the methodology.
+    This adapter processes only one padded or trimmed 30-second Whisper
+    window. It does not reproduce the complete long-audio segmentation,
+    timestamp handling, and context propagation performed by
+    ``model.transcribe()``. This is acceptable for the short banking-command
+    recordings used in this study but must be documented.
     """
 
-    DEFAULT_TEMPERATURES = (
+    DEFAULT_TEMPERATURES: Tuple[float, ...] = (
         0.0,
         0.2,
         0.4,
@@ -63,7 +58,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
     def __init__(
         self,
         config: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         super().__init__(config)
 
         self.name = "whisper_direct_decode"
@@ -78,29 +73,21 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 "device",
                 DEVICE,
             )
-        ).lower()
+        ).lower().strip()
 
-        if not requested_device.startswith("cuda"):
-            raise ValueError(
-                "This benchmark suite is GPU-only. "
-                f"Received device='{requested_device}'. "
-                "Run with '--device cuda' or '--device cuda:0'."
-            )
-
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "CUDA was requested, but no CUDA-compatible GPU "
-                "is available in the current environment."
-            )
-
-        self.device = requested_device
+        self.device = self._validate_cuda_device(
+            requested_device
+        )
 
         configured_temperatures = self.config.get(
             "temperatures",
             self.DEFAULT_TEMPERATURES,
         )
 
-        if isinstance(configured_temperatures, (int, float)):
+        if isinstance(
+            configured_temperatures,
+            (int, float),
+        ):
             configured_temperatures = (
                 float(configured_temperatures),
             )
@@ -115,15 +102,20 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 "At least one decoding temperature is required."
             )
 
-        if any(value < 0.0 for value in self.temperatures):
+        if any(
+            value < 0.0
+            for value in self.temperatures
+        ):
             raise ValueError(
                 "Decoding temperatures cannot be negative."
             )
 
-        self.compression_ratio_threshold = self._optional_float(
-            self.config.get(
-                "compression_ratio_threshold",
-                2.4,
+        self.compression_ratio_threshold = (
+            self._optional_float(
+                self.config.get(
+                    "compression_ratio_threshold",
+                    2.4,
+                )
             )
         )
 
@@ -154,6 +146,54 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
 
         return float(value)
 
+    @staticmethod
+    def _validate_cuda_device(
+        requested_device: str,
+    ) -> str:
+        """Validate and normalize the requested CUDA device."""
+
+        try:
+            device = torch.device(requested_device)
+        except (RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid device value: '{requested_device}'."
+            ) from exc
+
+        if device.type != "cuda":
+            raise ValueError(
+                "WhisperDirectDecodeAdapter requires CUDA. "
+                f"Received device='{requested_device}'. "
+                "Use '--device cuda' or '--device cuda:0'."
+            )
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but no CUDA-compatible GPU "
+                "is available in the current environment."
+            )
+
+        device_index = (
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        )
+
+        if (
+            device_index < 0
+            or device_index >= torch.cuda.device_count()
+        ):
+            raise ValueError(
+                f"CUDA device index {device_index} is unavailable. "
+                f"Available CUDA devices: "
+                f"{torch.cuda.device_count()}."
+            )
+
+        return (
+            f"cuda:{device_index}"
+            if device.index is not None
+            else "cuda"
+        )
+
     def load(self):
         """Load the Whisper model."""
 
@@ -176,18 +216,22 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
         self,
         mel: torch.Tensor,
     ):
-        """Decode one mel window using Whisper-style fallback logic,
-        matching OpenAI's actual decode_with_fallback() in transcribe.py.
+        """Decode one mel window using Whisper-style fallback logic.
 
         Returns:
             A tuple containing:
 
-            - selected DecodingResult
-            - temperatures attempted
-            - whether fallback occurred
-            - reason that requested the final fallback
-            - whether the no-speech override cancelled fallback
+            - selected decoding result;
+            - temperatures attempted;
+            - whether multiple temperatures were attempted;
+            - final fallback reason;
+            - whether the silence override stopped fallback.
         """
+
+        if self._model is None:
+            raise RuntimeError(
+                "Whisper model is not loaded."
+            )
 
         selected_result = None
         temperatures_attempted = []
@@ -202,15 +246,8 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             options = whisper.DecodingOptions(
                 task="transcribe",
                 language="en",
-
-                # Keep precision aligned with the corrected
-                # FP32 Whisper baseline.
                 fp16=False,
-
-                # Preserve timestamp-token generation.
                 without_timestamps=False,
-
-                # Each call performs one decoding attempt.
                 temperature=temperature,
             )
 
@@ -223,20 +260,19 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
 
             selected_result = result
 
-            # Matches OpenAI's needs_fallback logic exactly:
-            # compression_ratio and logprob each independently trigger
-            # fallback; no_speech_threshold, if exceeded, unconditionally
-            # cancels fallback regardless of the other two checks.
             needs_fallback = False
             fallback_reasons = []
 
             if (
-                self.compression_ratio_threshold is not None
+                self.compression_ratio_threshold
+                is not None
                 and result.compression_ratio
                 > self.compression_ratio_threshold
             ):
                 needs_fallback = True
-                fallback_reasons.append("compression_ratio")
+                fallback_reasons.append(
+                    "compression_ratio"
+                )
 
             if (
                 self.logprob_threshold is not None
@@ -244,31 +280,45 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 < self.logprob_threshold
             ):
                 needs_fallback = True
-                fallback_reasons.append("average_log_probability")
+                fallback_reasons.append(
+                    "average_log_probability"
+                )
 
             this_attempt_no_speech_override = False
 
+            # Match OpenAI Whisper's current silence override:
+            # fallback is cancelled only when the result has both
+            # high no-speech probability and low average log probability.
             if (
                 self.no_speech_threshold is not None
                 and result.no_speech_prob
                 > self.no_speech_threshold
+                and self.logprob_threshold is not None
+                and result.avg_logprob
+                < self.logprob_threshold
             ):
-                # Unconditional override, matching OpenAI's source
-                # exactly: treat as silence and stop escalating
-                # temperature, regardless of the two checks above.
                 needs_fallback = False
                 this_attempt_no_speech_override = True
 
             if not needs_fallback:
-                no_speech_override_used = this_attempt_no_speech_override
+                no_speech_override_used = (
+                    this_attempt_no_speech_override
+                )
+
                 final_fallback_reason = (
                     None
-                    if not fallback_reasons or this_attempt_no_speech_override
+                    if (
+                        not fallback_reasons
+                        or this_attempt_no_speech_override
+                    )
                     else ",".join(fallback_reasons)
                 )
+
                 break
 
-            final_fallback_reason = ",".join(fallback_reasons)
+            final_fallback_reason = ",".join(
+                fallback_reasons
+            )
 
         if selected_result is None:
             raise RuntimeError(
@@ -311,14 +361,14 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 f"Audio path is not a file: {audio_path}"
             )
 
-        torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(
+            device=self.device
+        )
 
-        # Start before audio loading so the latency boundary
-        # matches the file-to-text baseline measurement.
         total_start = time.perf_counter()
 
         # -------------------------------------------------
-        # Stage 1: Load and resample audio
+        # Stage 1: Decode and resample the source file
         # -------------------------------------------------
         audio_load_start = time.perf_counter()
 
@@ -333,12 +383,14 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             ) from exc
 
         audio_load_ms = (
-            time.perf_counter() - audio_load_start
-        ) * 1000
+            time.perf_counter()
+            - audio_load_start
+        ) * 1000.0
 
         if audio.size == 0:
             raise ValueError(
-                f"Audio file contains no samples: {audio_path}"
+                f"Audio file contains no samples: "
+                f"{audio_path}"
             )
 
         original_sample_count = int(
@@ -347,7 +399,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
 
         original_duration_s = (
             original_sample_count
-            / whisper.audio.SAMPLE_RATE
+            / float(whisper.audio.SAMPLE_RATE)
         )
 
         # -------------------------------------------------
@@ -360,8 +412,9 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
         )
 
         pad_trim_ms = (
-            time.perf_counter() - pad_trim_start
-        ) * 1000
+            time.perf_counter()
+            - pad_trim_start
+        ) * 1000.0
 
         # -------------------------------------------------
         # Stage 3: Create the log-Mel spectrogram
@@ -373,16 +426,21 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             n_mels=self._model.dims.n_mels,
         ).to(self.device)
 
-        torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(
+            device=self.device
+        )
 
         mel_spectrogram_ms = (
-            time.perf_counter() - mel_start
-        ) * 1000
+            time.perf_counter()
+            - mel_start
+        ) * 1000.0
 
         # -------------------------------------------------
-        # Stage 4: Direct decoding with fallback
+        # Stage 4: Decode with temperature fallback
         # -------------------------------------------------
-        torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(
+            device=self.device
+        )
 
         decode_start = time.perf_counter()
 
@@ -396,14 +454,18 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             mel
         )
 
-        torch.cuda.synchronize(device=self.device)
+        torch.cuda.synchronize(
+            device=self.device
+        )
 
         decode_latency_ms = (
-            time.perf_counter() - decode_start
-        ) * 1000
+            time.perf_counter()
+            - decode_start
+        ) * 1000.0
 
-        # Match Whisper's normal no-speech handling as closely
-        # as possible for this single-window direct pipeline.
+        # -------------------------------------------------
+        # Stage 5: Apply Whisper-style silence handling
+        # -------------------------------------------------
         no_speech_detected = False
 
         if (
@@ -420,19 +482,19 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
             ):
                 no_speech_detected = False
 
-        # Text extraction included inside the timed region.
         text = (
             ""
             if no_speech_detected
-            else result.text.strip()
+            else str(result.text or "").strip()
         )
 
         total_latency_ms = (
-            time.perf_counter() - total_start
-        ) * 1000
+            time.perf_counter()
+            - total_start
+        ) * 1000.0
 
         real_time_factor = (
-            (total_latency_ms / 1000)
+            (total_latency_ms / 1000.0)
             / original_duration_s
             if original_duration_s > 0
             else None
@@ -457,6 +519,7 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 "device": self.device,
                 "precision": "fp32",
                 "language": "en",
+                "task": "transcribe",
                 "direct_decode": True,
                 "single_window_decode": True,
                 "long_audio_chunking_enabled": False,
@@ -471,7 +534,9 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 "temperatures_attempted": (
                     temperatures_attempted
                 ),
-                "fallback_enabled": True,
+                "fallback_enabled": (
+                    len(self.temperatures) > 1
+                ),
                 "fallback_used": fallback_used,
                 "final_fallback_reason": (
                     final_fallback_reason
@@ -503,6 +568,12 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                 "generated_token_count": (
                     generated_token_count
                 ),
+                "original_sample_count": (
+                    original_sample_count
+                ),
+                "original_sample_rate": (
+                    whisper.audio.SAMPLE_RATE
+                ),
                 "original_duration_s": (
                     original_duration_s
                 ),
@@ -528,26 +599,27 @@ class WhisperDirectDecodeAdapter(BaseAdapter):
                     "direct_encoder_execution",
                     "direct_decoder_execution",
                     "temperature_fallback_attempts",
-                    "text_generation",
+                    "silence_decision",
+                    "text_extraction",
                 ],
                 "methodological_limitation": (
                     "Direct decode processes one padded or "
                     "trimmed 30-second window and does not "
-                    "replicate transcribe() long-audio "
+                    "replicate model.transcribe() long-audio "
                     "segmentation or context propagation. "
-                    "Encoder recomputation on fallback is NOT an "
-                    "extra cost specific to this adapter: OpenAI's "
-                    "own transcribe() also recomputes the encoder "
-                    "on every fallback attempt via model.decode()."
+                    "Each fallback attempt invokes another "
+                    "decode operation and encoder pass, as in "
+                    "OpenAI Whisper's high-level fallback loop."
                 ),
             },
         }
 
     def close(self) -> None:
-        """Release Whisper model resources."""
+        """Release Whisper model and CUDA resources."""
 
         self._model = None
 
         gc.collect()
 
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
