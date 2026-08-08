@@ -21,7 +21,7 @@ AUDIO_DIR = pathlib.Path("data/minds14_banking_raw")
 MODEL_SIZE = "small"
 DEVICE = "cuda:0"
 
-EXPECTED_FILES = 41
+EXPECTED_FILES = 809
 
 WARMUP_RUNS = 3
 MEASURED_RUNS = 10
