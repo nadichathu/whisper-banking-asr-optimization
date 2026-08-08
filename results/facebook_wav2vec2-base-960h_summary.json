@@ -1,1 +1,0 @@
-{"model": "facebook_wav2vec2-base-960h", "n_files": 41, "runs_csv": "results\\facebook_wav2vec2-base-960h_runs.csv", "per_file_csv": "results\\facebook_wav2vec2-base-960h_per_file.csv", "env": "{\"platform\": \"Windows-11-10.0.26200-SP0\", \"python\": \"3.13.5\", \"time\": \"2026-07-09 10:02:04\"}", "corpus_wer": 0.20532319391634982}

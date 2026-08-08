@@ -1,8 +1,0 @@
-# Optional extras for bench adapters
-transformers
-torch
-torchaudio
-soundfile
-librosa
-vosk
-jiwer

@@ -1,4 +1,15 @@
+@"
 .venv/
 __pycache__/
 *.pyc
-results_smoke_test_backup/
+.ipynb_checkpoints/
+
+results/
+
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+.DS_Store
+"@ | Set-Content .gitignore

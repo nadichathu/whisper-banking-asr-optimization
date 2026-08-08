@@ -100,6 +100,22 @@ ADAPTER_REGISTRY = {
         "bench.adapters.nemo_fastconformer_adapter",
         "NeMoFastConformerAdapter",
     ),
+
+    # --------------------------------------------------------
+    # New external / precision comparison conditions
+    # --------------------------------------------------------
+    "qwen3_asr": (
+        "bench.adapters.qwen3_asr_adapter",
+        "Qwen3ASRAdapter",
+    ),
+    "distil_whisper": (
+        "bench.adapters.distil_whisper_adapter",
+        "DistilWhisperAdapter",
+    ),
+    "faster_whisper_small_bf16": (
+        "bench.adapters.faster_whisper_small_bf16_adapter",
+        "FasterWhisperSmallBF16Adapter",
+    ),
 }
 
 
@@ -911,6 +927,16 @@ def run_benchmark(
             Any,
         ] = {}
 
+        # --------------------------------------------------------
+        # Optional adapter diagnostics aggregated across measured
+        # runs. These remain generic so adapters that do not expose
+        # such metadata are unaffected.
+        # --------------------------------------------------------
+        fallback_metadata_observed = False
+        fallback_detected_run_count = 0
+        fallback_detected_files = set()
+        accepted_fallback_temperatures = set()
+
         total_files = len(
             selected_audio_files
         )
@@ -1017,6 +1043,58 @@ def run_benchmark(
                     representative_adapter_meta = dict(
                         raw_meta
                     )
+
+                # ------------------------------------------------
+                # Optional fallback diagnostics.
+                #
+                # New Distil-Whisper metadata uses
+                # "fallback_detected_from_emitted_segments".
+                # "fallback_used" is also accepted defensively for
+                # compatibility with alternative Whisper adapters.
+                # ------------------------------------------------
+                fallback_flag = raw_meta.get(
+                    "fallback_detected_from_emitted_segments",
+                    raw_meta.get(
+                        "fallback_used",
+                        None,
+                    ),
+                )
+
+                if fallback_flag is not None:
+                    fallback_metadata_observed = True
+
+                    if bool(fallback_flag):
+                        fallback_detected_run_count += 1
+                        fallback_detected_files.add(
+                            file_name
+                        )
+
+                    temperatures = raw_meta.get(
+                        "accepted_segment_temperatures",
+                        [],
+                    )
+
+                    if isinstance(
+                        temperatures,
+                        (list, tuple, set),
+                    ):
+                        for temperature in temperatures:
+                            try:
+                                temperature_value = float(
+                                    temperature
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                            ):
+                                continue
+
+                            if math.isfinite(
+                                temperature_value
+                            ):
+                                accepted_fallback_temperatures.add(
+                                    temperature_value
+                                )
 
                 adapter_latencies.append(
                     adapter_latency_ms
@@ -1424,6 +1502,37 @@ def run_benchmark(
             for row in per_run_rows
         ]
 
+        adapter_diagnostics: Dict[
+            str,
+            Any,
+        ] = {}
+
+        if fallback_metadata_observed:
+            adapter_diagnostics[
+                "temperature_fallback"
+            ] = {
+                "metadata_observed": True,
+                "fallback_detected_run_count": (
+                    fallback_detected_run_count
+                ),
+                "fallback_detected_file_count": (
+                    len(fallback_detected_files)
+                ),
+                "fallback_detected_files": sorted(
+                    fallback_detected_files
+                ),
+                "accepted_segment_temperatures_observed": sorted(
+                    accepted_fallback_temperatures
+                ),
+                "interpretation": (
+                    "A positive accepted segment temperature "
+                    "shows that Whisper fallback advanced beyond "
+                    "the initial temperature-zero attempt for that "
+                    "emitted segment. Rejected attempts are not "
+                    "reconstructed by this runner."
+                ),
+            }
+
         summary = {
             "run_id": run_id,
             "model": model_name,
@@ -1435,6 +1544,13 @@ def run_benchmark(
             ),
             "adapter_metadata": (
                 representative_adapter_meta
+            ),
+            "adapter_metadata_scope": (
+                "First measured run only; complete run-specific "
+                "metadata is stored in runs.csv."
+            ),
+            "adapter_diagnostics": (
+                adapter_diagnostics
             ),
             "device": adapter_device,
             "primary_latency_metric": (
@@ -1606,8 +1722,10 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Optional model size override, such as "
-            "'tiny', 'base', 'small', or 'medium'."
+            "Optional model-size override for adapters that support it. "
+            "Fixed experimental adapters (for example Qwen3-ASR, "
+            "Distil-Whisper, and Faster-Whisper Small BF16) intentionally "
+            "reject incompatible overrides."
         ),
     )
 

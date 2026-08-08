@@ -1,3 +1,14 @@
+# ASR benchmark requirements
+#
+# IMPORTANT:
+# - Install into a fresh/cloned benchmark environment where possible.
+# - qwen-asr 0.0.6 officially requires transformers==4.57.6 and
+#   accelerate==1.12.0; these exact constraints are repeated below
+#   intentionally so the resolver cannot silently choose another version.
+# - After the environment is validated, capture an immutable lock/snapshot
+#   with:  pip freeze > requirements.lock.txt
+# - System-level FFmpeg must also be available for OpenAI Whisper.
+
 # Core deep learning stack
 torch
 torchaudio
@@ -8,8 +19,13 @@ faster-whisper
 ctranslate2
 nemo_toolkit[asr]
 
-# Hugging Face stack (Wav2Vec2, MINDS-14 loading)
-transformers
+# Qwen3-ASR official package
+qwen-asr==0.0.6
+
+# Hugging Face / Qwen stack
+transformers==4.57.6
+accelerate==1.12.0
+huggingface-hub
 datasets
 
 # Data handling / metrics
@@ -22,7 +38,7 @@ tqdm
 matplotlib
 psutil
 
-# Audio I/O
+# Audio I/O / preprocessing
 soundfile
 librosa
 silero-vad

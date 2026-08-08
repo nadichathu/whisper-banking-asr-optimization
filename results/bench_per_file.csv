@@ -1,3 +1,0 @@
-file,n_runs,mean_latency_ms,p50,p95,p99,best_ms,worst_ms,canonical_transcript,reference,wer
-balance.wav,5,3350.0051599998187,3411.762599999747,3686.608079999678,3718.777295999571,2690.6622999995307,3726.819599999544,What is my account balance?,What is my account balance?,0.0
-check_balance.wav,5,3354.142680000041,3460.4840000001786,3758.8348200002656,3787.406084000322,2934.7070999992866,3794.5489000003363,Check my account balance.,Check my account balance.,0.0

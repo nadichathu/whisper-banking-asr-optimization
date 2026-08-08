@@ -1,1 +1,0 @@
-{"model": "whisperadapter", "n_files": 41, "runs_csv": "results\\whisperadapter_runs.csv", "per_file_csv": "results\\whisperadapter_per_file.csv", "env": "{\"platform\": \"Windows-11-10.0.26200-SP0\", \"python\": \"3.13.5\", \"time\": \"2026-07-20 11:09:05\"}", "corpus_wer": 0.053231939163498096}
