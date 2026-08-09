@@ -35,7 +35,7 @@ RANDOM_SEED = 2026
 # ============================================================
 
 def cuda_sync(device):
-    """Wait until all queued CUDA work on the selected device is complete."""
+    """Synchronize CUDA before/after GPU timing boundaries."""
     torch.cuda.synchronize(device)
 
 
@@ -47,7 +47,6 @@ def safe_package_version(package_name):
 
 
 def git_metadata():
-    """Collect lightweight Git provenance without failing the benchmark."""
     metadata = {
         "commit": None,
         "branch": None,
@@ -78,105 +77,141 @@ def git_metadata():
     return metadata
 
 
-def bootstrap_median_ci(values, rng, n_resamples=10_000):
+def bootstrap_median_ci(
+    values,
+    rng,
+    n_resamples=10_000
+):
     """
-    Bootstrap 95% confidence interval for the median.
+    Bootstrap 95% CI for the median.
 
-    Input should be the 41 utterance-level values,
-    not the 410 repeated measurements.
+    Input:
+        one median latency value per utterance.
+
+    For this experiment:
+        809 utterance-level observations.
     """
-    values = np.asarray(values, dtype=float)
+
+    values = np.asarray(
+        values,
+        dtype=float
+    )
 
     samples = rng.choice(
         values,
-        size=(n_resamples, len(values)),
+        size=(
+            n_resamples,
+            len(values)
+        ),
         replace=True
     )
 
-    medians = np.median(samples, axis=1)
+    medians = np.median(
+        samples,
+        axis=1
+    )
 
     return (
-        float(np.percentile(medians, 2.5)),
-        float(np.percentile(medians, 97.5)),
+        float(
+            np.percentile(
+                medians,
+                2.5
+            )
+        ),
+        float(
+            np.percentile(
+                medians,
+                97.5
+            )
+        ),
     )
 
 
 # ============================================================
-# ONE PROFILED INFERENCE
+# GPU PROFILE
 # ============================================================
 
-def profile_once(model, audio_path, device, decode_options):
+def profile_once(
+    model,
+    audio_path,
+    device,
+    decode_options
+):
     """
-    Profile one Whisper Small inference path.
+    Profile the Whisper Small GPU inference pathway.
 
-    Important:
-    - Encoder is executed exactly once.
-    - whisper.decode() receives already-encoded audio features.
-    - decode_stage_ms therefore excludes the explicit encoder stage.
-    - decode_stage_ms still includes Whisper's autoregressive decoding
-      machinery, token selection/filtering, ranking and text construction.
-      It is NOT a pure decoder-kernel measurement.
+    Pipeline
+    --------
+    1. WAV decoding using Whisper/FFmpeg on CPU
+       - measured separately
+       - NOT counted as GPU inference latency
+
+    2. Waveform CPU -> GPU transfer
+
+    3. Pad / trim on GPU
+
+    4. Log-Mel spectrogram on GPU
+
+    5. Whisper encoder on GPU
+
+    6. Whisper autoregressive decoding on GPU
+
+    Two aggregate measurements are reported:
+
+    gpu_compute_wall_ms
+        Pad/trim + log-Mel + encoder + decoding.
+        This is the principal GPU inference metric.
+
+    gpu_pipeline_wall_ms
+        CPU->GPU waveform transfer + all GPU computation.
+
+    CPU WAV loading is deliberately reported separately.
     """
 
-    total_start = time.perf_counter()
-
     # --------------------------------------------------------
-    # Stage 1 — Audio loading
-    # CPU / FFmpeg path used by OpenAI Whisper
-    # --------------------------------------------------------
-
-    t0 = time.perf_counter()
-
-    audio = whisper.load_audio(str(audio_path))
-
-    t1 = time.perf_counter()
-
-    load_audio_ms = (t1 - t0) * 1000.0
-
-
-    # --------------------------------------------------------
-    # Stage 2 — Pad / trim
-    # Pads each short command to Whisper's 30-second input
-    # --------------------------------------------------------
-
-    t0 = time.perf_counter()
-
-    audio = whisper.pad_or_trim(audio)
-
-    t1 = time.perf_counter()
-
-    pad_trim_ms = (t1 - t0) * 1000.0
-
-
-    # --------------------------------------------------------
-    # Stage 3 — Log-Mel spectrogram
+    # Stage 0 — WAV loading / decoding
     #
-    # Kept on CPU deliberately so that preprocessing and
-    # host-to-device transfer remain separate measurements.
+    # whisper.load_audio() uses FFmpeg and CPU.
+    # This cannot be considered GPU model inference.
     # --------------------------------------------------------
 
-    t0 = time.perf_counter()
+    cpu_start = time.perf_counter()
 
-    mel_cpu = whisper.log_mel_spectrogram(
-        audio,
-        n_mels=model.dims.n_mels
+    audio_np = whisper.load_audio(
+        str(audio_path)
     )
 
-    t1 = time.perf_counter()
+    cpu_end = time.perf_counter()
 
-    mel_cpu_ms = (t1 - t0) * 1000.0
+    load_audio_cpu_ms = (
+        cpu_end - cpu_start
+    ) * 1000.0
 
 
     # --------------------------------------------------------
-    # Stage 4 — CPU -> GPU transfer
+    # Convert NumPy waveform to Torch tensor.
+    #
+    # torch.from_numpy() itself does not copy the waveform.
+    # --------------------------------------------------------
+
+    audio_cpu = torch.from_numpy(
+        audio_np
+    )
+
+
+    # --------------------------------------------------------
+    # Stage 1 — Waveform CPU -> GPU
     # --------------------------------------------------------
 
     cuda_sync(device)
 
+    pipeline_start = time.perf_counter()
+
     t0 = time.perf_counter()
 
-    mel_gpu = mel_cpu.to(
+    audio_gpu = audio_cpu.to(
         device=device,
+        dtype=torch.float32,
         non_blocking=False
     )
 
@@ -184,11 +219,83 @@ def profile_once(model, audio_path, device, decode_options):
 
     t1 = time.perf_counter()
 
-    h2d_transfer_ms = (t1 - t0) * 1000.0
+    waveform_h2d_ms = (
+        t1 - t0
+    ) * 1000.0
 
 
     # --------------------------------------------------------
-    # Stage 5 — Whisper audio encoder
+    # Principal GPU computation begins here.
+    # --------------------------------------------------------
+
+    cuda_sync(device)
+
+    gpu_compute_start = time.perf_counter()
+
+
+    # --------------------------------------------------------
+    # Stage 2 — Pad / trim ON GPU
+    # --------------------------------------------------------
+
+    t0 = time.perf_counter()
+
+    audio_gpu = whisper.pad_or_trim(
+        audio_gpu
+    )
+
+    cuda_sync(device)
+
+    t1 = time.perf_counter()
+
+    pad_trim_gpu_ms = (
+        t1 - t0
+    ) * 1000.0
+
+
+    # --------------------------------------------------------
+    # Stage 3 — Log-Mel spectrogram ON GPU
+    #
+    # Passing a CUDA tensor ensures the STFT / Mel operations
+    # execute on the selected GPU.
+    # --------------------------------------------------------
+
+    cuda_sync(device)
+
+    t0 = time.perf_counter()
+
+    mel_gpu = whisper.log_mel_spectrogram(
+        audio_gpu,
+        n_mels=model.dims.n_mels
+    )
+
+    cuda_sync(device)
+
+    t1 = time.perf_counter()
+
+    mel_gpu_ms = (
+        t1 - t0
+    ) * 1000.0
+
+
+    # --------------------------------------------------------
+    # Validate Mel tensor placement
+    # --------------------------------------------------------
+
+    if not mel_gpu.is_cuda:
+        raise RuntimeError(
+            "Log-Mel spectrogram unexpectedly "
+            "returned a CPU tensor."
+        )
+
+    if mel_gpu.device != device:
+        raise RuntimeError(
+            "Mel tensor is on the wrong CUDA device. "
+            f"Expected {device}, got {mel_gpu.device}."
+        )
+
+
+    # --------------------------------------------------------
+    # Stage 4 — Whisper encoder ON GPU
     # --------------------------------------------------------
 
     cuda_sync(device)
@@ -196,6 +303,7 @@ def profile_once(model, audio_path, device, decode_options):
     t0 = time.perf_counter()
 
     with torch.inference_mode():
+
         encoded_audio = model.encoder(
             mel_gpu.unsqueeze(0)
         )
@@ -204,12 +312,13 @@ def profile_once(model, audio_path, device, decode_options):
 
     t1 = time.perf_counter()
 
-    encoder_ms = (t1 - t0) * 1000.0
+    encoder_gpu_ms = (
+        t1 - t0
+    ) * 1000.0
 
 
     # --------------------------------------------------------
-    # Sanity check:
-    # encoded features must have Whisper's expected shape
+    # Encoder-output validation
     # --------------------------------------------------------
 
     expected_feature_shape = (
@@ -217,24 +326,34 @@ def profile_once(model, audio_path, device, decode_options):
         model.dims.n_audio_state,
     )
 
-    if tuple(encoded_audio.shape[-2:]) != expected_feature_shape:
+    if (
+        tuple(encoded_audio.shape[-2:])
+        != expected_feature_shape
+    ):
         raise RuntimeError(
             "Unexpected encoder output shape. "
-            f"Expected final dimensions {expected_feature_shape}, "
-            f"got {tuple(encoded_audio.shape[-2:])}."
+            f"Expected {expected_feature_shape}, "
+            f"got "
+            f"{tuple(encoded_audio.shape[-2:])}."
+        )
+
+    if not encoded_audio.is_cuda:
+        raise RuntimeError(
+            "Encoder output unexpectedly "
+            "resides on CPU."
         )
 
 
     # --------------------------------------------------------
-    # Stage 6 — Whisper decoding stage
+    # Stage 5 — Whisper decoding ON GPU
     #
-    # encoded_audio is 3-D:
-    # [batch, n_audio_ctx, n_audio_state]
+    # encoded_audio is already encoded.
+    # whisper.decode() therefore does NOT run
+    # the encoder again.
     #
-    # whisper.decode() therefore returns List[DecodingResult].
-    #
-    # The internal _get_audio_features() detects that this is
-    # already encoded audio and DOES NOT run the encoder again.
+    # This stage includes autoregressive decoding,
+    # token selection/filtering, ranking and text
+    # construction. It is not pure decoder-kernel time.
     # --------------------------------------------------------
 
     cuda_sync(device)
@@ -253,68 +372,120 @@ def profile_once(model, audio_path, device, decode_options):
 
     t1 = time.perf_counter()
 
-    decode_stage_ms = (t1 - t0) * 1000.0
-
-
-    # --------------------------------------------------------
-    # Correct handling of the batched return value
-    # --------------------------------------------------------
-
-    if not isinstance(decoded_results, list):
-        raise RuntimeError(
-            "Expected whisper.decode() to return a list because "
-            "encoded_audio is a 3-D batched tensor."
-        )
-
-    if len(decoded_results) != 1:
-        raise RuntimeError(
-            "Expected exactly one decoding result, "
-            f"but received {len(decoded_results)}."
-        )
-
-    result = decoded_results[0]
-
-    transcript = result.text.strip()
-
-
-    # --------------------------------------------------------
-    # Actual wall-clock time for the complete profiled path
-    # --------------------------------------------------------
-
-    total_end = time.perf_counter()
-
-    total_profile_wall_ms = (
-        total_end - total_start
+    decode_gpu_ms = (
+        t1 - t0
     ) * 1000.0
 
 
     # --------------------------------------------------------
-    # Sum of individually timed stages
-    #
-    # Kept separately because median(stage sums) and
-    # sum(stage medians) are mathematically different.
+    # End principal GPU compute timing
     # --------------------------------------------------------
 
-    stage_sum_ms = (
-        load_audio_ms
-        + pad_trim_ms
-        + mel_cpu_ms
-        + h2d_transfer_ms
-        + encoder_ms
-        + decode_stage_ms
+    cuda_sync(device)
+
+    gpu_compute_end = time.perf_counter()
+
+    gpu_compute_wall_ms = (
+        gpu_compute_end
+        - gpu_compute_start
+    ) * 1000.0
+
+
+    # --------------------------------------------------------
+    # End GPU pipeline:
+    # transfer + GPU computation
+    # --------------------------------------------------------
+
+    pipeline_end = time.perf_counter()
+
+    gpu_pipeline_wall_ms = (
+        pipeline_end
+        - pipeline_start
+    ) * 1000.0
+
+
+    # --------------------------------------------------------
+    # Decode result validation
+    # --------------------------------------------------------
+
+    if not isinstance(
+        decoded_results,
+        list
+    ):
+        raise RuntimeError(
+            "Expected whisper.decode() "
+            "to return a list."
+        )
+
+    if len(decoded_results) != 1:
+        raise RuntimeError(
+            "Expected exactly one decoding "
+            f"result, received "
+            f"{len(decoded_results)}."
+        )
+
+    transcript = (
+        decoded_results[0]
+        .text
+        .strip()
+    )
+
+
+    # --------------------------------------------------------
+    # Individually timed GPU stage sum
+    # --------------------------------------------------------
+
+    gpu_stage_sum_ms = (
+        pad_trim_gpu_ms
+        + mel_gpu_ms
+        + encoder_gpu_ms
+        + decode_gpu_ms
+    )
+
+    gpu_pipeline_stage_sum_ms = (
+        waveform_h2d_ms
+        + gpu_stage_sum_ms
     )
 
 
     return {
-        "load_audio_ms": load_audio_ms,
-        "pad_trim_ms": pad_trim_ms,
-        "mel_cpu_ms": mel_cpu_ms,
-        "h2d_transfer_ms": h2d_transfer_ms,
-        "encoder_ms": encoder_ms,
-        "decode_stage_ms": decode_stage_ms,
-        "stage_sum_ms": stage_sum_ms,
-        "total_profile_wall_ms": total_profile_wall_ms,
-        "transcript": transcript,
+
+        # CPU diagnostic only
+        "load_audio_cpu_ms":
+            load_audio_cpu_ms,
+
+        # Transfer
+        "waveform_h2d_ms":
+            waveform_h2d_ms,
+
+        # GPU stages
+        "pad_trim_gpu_ms":
+            pad_trim_gpu_ms,
+
+        "mel_gpu_ms":
+            mel_gpu_ms,
+
+        "encoder_gpu_ms":
+            encoder_gpu_ms,
+
+        "decode_gpu_ms":
+            decode_gpu_ms,
+
+        # Aggregates
+        "gpu_stage_sum_ms":
+            gpu_stage_sum_ms,
+
+        "gpu_compute_wall_ms":
+            gpu_compute_wall_ms,
+
+        "gpu_pipeline_stage_sum_ms":
+            gpu_pipeline_stage_sum_ms,
+
+        "gpu_pipeline_wall_ms":
+            gpu_pipeline_wall_ms,
+
+        "transcript":
+            transcript,
     }
 
 
@@ -331,37 +502,58 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is unavailable. "
-            "This experiment must be executed on the GPU."
+            "GPU profiling cannot proceed."
         )
 
-    device = torch.device(DEVICE)
+    device = torch.device(
+        DEVICE
+    )
 
     if device.type != "cuda":
         raise RuntimeError(
-            f"GPU profiling requires CUDA; received {DEVICE}."
+            "This profiler requires CUDA. "
+            f"Received device: {DEVICE}"
         )
 
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(
+        device
+    )
 
-    gpu_name = torch.cuda.get_device_name(device)
-    gpu_properties = torch.cuda.get_device_properties(device)
+    gpu_name = (
+        torch.cuda.get_device_name(
+            device
+        )
+    )
+
+    gpu_properties = (
+        torch.cuda.get_device_properties(
+            device
+        )
+    )
 
 
     # --------------------------------------------------------
     # Dataset validation
     # --------------------------------------------------------
 
-    audio_files = sorted(AUDIO_DIR.glob("*.wav"))
+    audio_files = sorted(
+        AUDIO_DIR.glob("*.wav")
+    )
 
     if not audio_files:
         raise RuntimeError(
-            f"No WAV files found in {AUDIO_DIR.resolve()}"
+            "No WAV files found in "
+            f"{AUDIO_DIR.resolve()}"
         )
 
-    if len(audio_files) != EXPECTED_FILES:
+    if (
+        len(audio_files)
+        != EXPECTED_FILES
+    ):
         raise RuntimeError(
-            f"Expected {EXPECTED_FILES} WAV files, "
-            f"but found {len(audio_files)}."
+            f"Expected {EXPECTED_FILES} "
+            f"WAV files, but found "
+            f"{len(audio_files)}."
         )
 
 
@@ -371,50 +563,116 @@ def main():
 
     run_id = datetime.now(
         timezone.utc
-    ).strftime("%Y%m%dT%H%M%SZ")
+    ).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
 
-    output_dir = pathlib.Path(
-        "results"
-    ) / f"whisper_gpu_profile_{run_id}"
+    output_dir = (
+        pathlib.Path("results")
+        / f"whisper_gpu_profile_{run_id}"
+    )
 
     output_dir.mkdir(
         parents=True,
         exist_ok=False
     )
 
-    raw_path = output_dir / "raw_runs.csv"
-    per_file_path = output_dir / "per_file.csv"
-    stage_summary_path = output_dir / "stage_summary.csv"
-    metadata_path = output_dir / "metadata.json"
+    raw_path = (
+        output_dir
+        / "raw_runs.csv"
+    )
+
+    per_file_path = (
+        output_dir
+        / "per_file.csv"
+    )
+
+    stage_summary_path = (
+        output_dir
+        / "stage_summary.csv"
+    )
+
+    metadata_path = (
+        output_dir
+        / "metadata.json"
+    )
 
 
     # --------------------------------------------------------
-    # Display environment
+    # Environment display
     # --------------------------------------------------------
 
     print("=" * 80)
-    print("WHISPER SMALL GPU STAGE PROFILING")
+    print(
+        "WHISPER SMALL GPU INFERENCE PROFILING"
+    )
     print("=" * 80)
 
-    print(f"GPU                : {gpu_name}")
-    print(f"CUDA device        : {device}")
-    print(f"GPU memory         : {gpu_properties.total_memory / 1024**3:.2f} GB")
-    print(f"PyTorch            : {torch.__version__}")
-    print(f"PyTorch CUDA       : {torch.version.cuda}")
-    print(f"OpenAI Whisper     : {safe_package_version('openai-whisper')}")
-    print(f"Model              : {MODEL_SIZE}")
-    print(f"Audio files        : {len(audio_files)}")
-    print(f"Warm-up runs       : {WARMUP_RUNS}")
-    print(f"Measured runs/file : {MEASURED_RUNS}")
-    print(f"Output directory   : {output_dir}")
+    print(
+        f"GPU                : "
+        f"{gpu_name}"
+    )
+
+    print(
+        f"CUDA device        : "
+        f"{device}"
+    )
+
+    print(
+        f"GPU memory         : "
+        f"{gpu_properties.total_memory / 1024**3:.2f} GB"
+    )
+
+    print(
+        f"PyTorch            : "
+        f"{torch.__version__}"
+    )
+
+    print(
+        f"PyTorch CUDA       : "
+        f"{torch.version.cuda}"
+    )
+
+    print(
+        f"OpenAI Whisper     : "
+        f"{safe_package_version('openai-whisper')}"
+    )
+
+    print(
+        f"Model              : "
+        f"{MODEL_SIZE}"
+    )
+
+    print(
+        f"Audio files        : "
+        f"{len(audio_files)}"
+    )
+
+    print(
+        f"Warm-up runs       : "
+        f"{WARMUP_RUNS}"
+    )
+
+    print(
+        f"Measured runs/file : "
+        f"{MEASURED_RUNS}"
+    )
+
+    print(
+        f"Output directory   : "
+        f"{output_dir}"
+    )
 
 
     # --------------------------------------------------------
-    # Load Whisper
-    # Model loading is deliberately excluded from profiling.
+    # Model loading
+    #
+    # Explicitly excluded from latency measurements.
     # --------------------------------------------------------
 
-    print("\nLoading Whisper model...")
+    print(
+        "\nLoading Whisper model..."
+    )
 
     model = whisper.load_model(
         MODEL_SIZE,
@@ -425,72 +683,131 @@ def main():
 
 
     # --------------------------------------------------------
-    # Verify FP32 baseline
+    # Verify model is on CUDA
     # --------------------------------------------------------
 
-    model_dtype = next(
+    model_parameter = next(
         model.parameters()
-    ).dtype
+    )
 
-    print(f"Model parameter dtype: {model_dtype}")
-
-    if model_dtype != torch.float32:
+    if not model_parameter.is_cuda:
         raise RuntimeError(
-            "Expected Whisper Small FP32 model parameters, "
-            f"but found {model_dtype}."
+            "Whisper model is not on GPU."
+        )
+
+    if (
+        model_parameter.device
+        != device
+    ):
+        raise RuntimeError(
+            "Whisper model loaded on "
+            "unexpected device. "
+            f"Expected {device}, "
+            f"got {model_parameter.device}."
+        )
+
+
+    # --------------------------------------------------------
+    # FP32 baseline validation
+    # --------------------------------------------------------
+
+    model_dtype = (
+        model_parameter.dtype
+    )
+
+    print(
+        f"Model parameter dtype: "
+        f"{model_dtype}"
+    )
+
+    if (
+        model_dtype
+        != torch.float32
+    ):
+        raise RuntimeError(
+            "Expected Whisper Small "
+            "FP32 parameters, but found "
+            f"{model_dtype}."
         )
 
 
     # --------------------------------------------------------
     # Explicit decoding configuration
-    #
-    # This profiles the FP32, timestamps-enabled,
-    # temperature-zero decoding path.
     # --------------------------------------------------------
 
-    decode_options = whisper.DecodingOptions(
-        task="transcribe",
-        language="en",
-        temperature=0.0,
-        fp16=False,
-        without_timestamps=False,
+    decode_options = (
+        whisper.DecodingOptions(
+            task="transcribe",
+            language="en",
+            temperature=0.0,
+            fp16=False,
+            without_timestamps=False,
+        )
     )
 
 
     # --------------------------------------------------------
-    # Save provenance metadata
+    # Provenance metadata
     # --------------------------------------------------------
 
     metadata = {
-        "created_utc": datetime.now(
-            timezone.utc
-        ).isoformat(),
 
-        "model": MODEL_SIZE,
-        "device": str(device),
-        "gpu_name": gpu_name,
-        "gpu_total_memory_bytes": gpu_properties.total_memory,
+        "created_utc":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
 
-        "python": platform.python_version(),
-        "platform": platform.platform(),
+        "model":
+            MODEL_SIZE,
 
-        "torch_version": torch.__version__,
-        "torch_cuda_version": torch.version.cuda,
+        "device":
+            str(device),
+
+        "gpu_name":
+            gpu_name,
+
+        "gpu_total_memory_bytes":
+            gpu_properties.total_memory,
+
+        "python":
+            platform.python_version(),
+
+        "platform":
+            platform.platform(),
+
+        "torch_version":
+            torch.__version__,
+
+        "torch_cuda_version":
+            torch.version.cuda,
+
         "openai_whisper_version":
-            safe_package_version("openai-whisper"),
+            safe_package_version(
+                "openai-whisper"
+            ),
 
-        "model_dtype": str(model_dtype),
+        "model_dtype":
+            str(model_dtype),
 
-        "dataset_directory": str(
-            AUDIO_DIR.resolve()
-        ),
-        "number_of_files": len(audio_files),
+        "dataset_directory":
+            str(
+                AUDIO_DIR.resolve()
+            ),
 
-        "warmup_runs": WARMUP_RUNS,
-        "measured_runs_per_file": MEASURED_RUNS,
+        "number_of_files":
+            len(audio_files),
 
-        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
-        "bootstrap_seed": RANDOM_SEED,
+        "warmup_runs":
+            WARMUP_RUNS,
+
+        "measured_runs_per_file":
+            MEASURED_RUNS,
+
+        "bootstrap_resamples":
+            BOOTSTRAP_RESAMPLES,
+
+        "bootstrap_seed":
+            RANDOM_SEED,
 
         "decode_options": {
             "task": "transcribe",
@@ -500,7 +817,32 @@ def main():
             "without_timestamps": False,
         },
 
+        "profiling_design": {
+            "wav_loading":
+                "CPU/FFmpeg; measured separately "
+                "and excluded from GPU inference latency",
+
+            "waveform_transfer":
+                "CPU-to-GPU transfer measured separately",
+
+            "pad_trim":
+                "GPU",
+
+            "log_mel":
+                "GPU",
+
+            "encoder":
+                "GPU",
+
+            "decode":
+                "GPU",
+
+            "primary_metric":
+                "gpu_compute_wall_ms",
+        },
+
         "torch_backend": {
+
             "cudnn_benchmark":
                 torch.backends.cudnn.benchmark,
 
@@ -514,21 +856,25 @@ def main():
                 torch.backends.cudnn.allow_tf32,
         },
 
-        "git": git_metadata(),
+        "git":
+            git_metadata(),
 
         "profiling_scope": (
-            "Exploratory stage-level profiling of one "
-            "Whisper Small FP32 single-window decoding path. "
-            "Not an exact decomposition of the high-level "
-            "model.transcribe() pipeline."
+            "Stage-level profiling of the "
+            "Whisper Small FP32 GPU inference path. "
+            "CPU WAV decoding is measured separately "
+            "and excluded from the principal GPU "
+            "inference latency metric."
         ),
     }
+
 
     with open(
         metadata_path,
         "w",
         encoding="utf-8"
     ) as f:
+
         json.dump(
             metadata,
             f,
@@ -537,14 +883,20 @@ def main():
 
 
     # --------------------------------------------------------
-    # Global warm-up
+    # Global GPU warm-up
     # --------------------------------------------------------
 
-    print("\nPerforming GPU warm-up...")
+    print(
+        "\nPerforming GPU warm-up..."
+    )
 
-    warmup_file = audio_files[0]
+    warmup_file = (
+        audio_files[0]
+    )
 
-    for i in range(WARMUP_RUNS):
+    for i in range(
+        WARMUP_RUNS
+    ):
 
         _ = profile_once(
             model,
@@ -554,12 +906,18 @@ def main():
         )
 
         print(
-            f"Warm-up {i + 1}/{WARMUP_RUNS} complete"
+            f"Warm-up "
+            f"{i + 1}/"
+            f"{WARMUP_RUNS} complete"
         )
 
-    cuda_sync(device)
+    cuda_sync(
+        device
+    )
 
-    print("Warm-up complete.")
+    print(
+        "GPU warm-up complete."
+    )
 
 
     # --------------------------------------------------------
@@ -568,13 +926,17 @@ def main():
 
     rows = []
 
-    for file_index, audio_path in enumerate(
+    for (
+        file_index,
+        audio_path
+    ) in enumerate(
         audio_files,
         start=1
     ):
 
         print(
-            f"\n[{file_index:02d}/{len(audio_files)}] "
+            f"\n[{file_index:03d}/"
+            f"{len(audio_files)}] "
             f"{audio_path.name}"
         )
 
@@ -591,22 +953,33 @@ def main():
             )
 
             row = {
-                "file": audio_path.name,
-                "run": run,
+                "file":
+                    audio_path.name,
+
+                "run":
+                    run,
+
                 **profile,
             }
 
-            rows.append(row)
+            rows.append(
+                row
+            )
 
             print(
                 f"Run {run:02d} | "
-                f"load={profile['load_audio_ms']:.2f} | "
-                f"pad={profile['pad_trim_ms']:.2f} | "
-                f"mel={profile['mel_cpu_ms']:.2f} | "
-                f"H2D={profile['h2d_transfer_ms']:.2f} | "
-                f"encoder={profile['encoder_ms']:.2f} | "
-                f"decode={profile['decode_stage_ms']:.2f} | "
-                f"total={profile['total_profile_wall_ms']:.2f} ms"
+                f"H2D="
+                f"{profile['waveform_h2d_ms']:.2f} | "
+                f"pad="
+                f"{profile['pad_trim_gpu_ms']:.2f} | "
+                f"mel="
+                f"{profile['mel_gpu_ms']:.2f} | "
+                f"encoder="
+                f"{profile['encoder_gpu_ms']:.2f} | "
+                f"decode="
+                f"{profile['decode_gpu_ms']:.2f} | "
+                f"GPU compute="
+                f"{profile['gpu_compute_wall_ms']:.2f} ms"
             )
 
 
@@ -614,32 +987,37 @@ def main():
     # Raw results
     # --------------------------------------------------------
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(
+        rows
+    )
 
 
-    stage_columns = [
-        "load_audio_ms",
-        "pad_trim_ms",
-        "mel_cpu_ms",
-        "h2d_transfer_ms",
-        "encoder_ms",
-        "decode_stage_ms",
+    gpu_stage_columns = [
+        "pad_trim_gpu_ms",
+        "mel_gpu_ms",
+        "encoder_gpu_ms",
+        "decode_gpu_ms",
     ]
 
 
     # --------------------------------------------------------
-    # Per-run stage percentages
+    # Per-run GPU stage shares
     # --------------------------------------------------------
 
-    measured_stage_sum = df[
-        stage_columns
-    ].sum(axis=1)
+    measured_gpu_stage_sum = (
+        df[gpu_stage_columns]
+        .sum(axis=1)
+    )
 
-    for stage in stage_columns:
+    for stage in (
+        gpu_stage_columns
+    ):
 
-        df[f"{stage}_share_pct"] = (
+        df[
+            f"{stage}_share_pct"
+        ] = (
             df[stage]
-            / measured_stage_sum
+            / measured_gpu_stage_sum
             * 100.0
         )
 
@@ -651,22 +1029,44 @@ def main():
 
 
     # --------------------------------------------------------
-    # Per-file latency medians
+    # Per-file medians
     #
-    # One file = one analytical latency observation,
-    # consistent with the main dissertation methodology.
+    # 809 utterances = 809 analytical observations.
+    # Each is the median of 10 measured runs.
     # --------------------------------------------------------
 
-    latency_columns = stage_columns + [
-        "stage_sum_ms",
-        "total_profile_wall_ms",
+    latency_columns = [
+
+        "load_audio_cpu_ms",
+
+        "waveform_h2d_ms",
+
+        "pad_trim_gpu_ms",
+
+        "mel_gpu_ms",
+
+        "encoder_gpu_ms",
+
+        "decode_gpu_ms",
+
+        "gpu_stage_sum_ms",
+
+        "gpu_compute_wall_ms",
+
+        "gpu_pipeline_stage_sum_ms",
+
+        "gpu_pipeline_wall_ms",
     ]
 
+
     per_file = (
-        df.groupby("file")[latency_columns]
+        df.groupby(
+            "file"
+        )[latency_columns]
         .median()
         .reset_index()
     )
+
 
     per_file.to_csv(
         per_file_path,
@@ -676,46 +1076,49 @@ def main():
 
     # --------------------------------------------------------
     # Stage contribution percentages
-    #
-    # Percentages are calculated at run level first.
-    # Then:
-    #   10 runs -> mean percentage for each file
-    #   41 files -> mean percentage across files
-    #
-    # This gives each utterance equal weight and causes the
-    # final stage percentages to sum to 100%.
     # --------------------------------------------------------
 
     share_columns = [
         f"{stage}_share_pct"
-        for stage in stage_columns
+        for stage
+        in gpu_stage_columns
     ]
 
     per_file_shares = (
-        df.groupby("file")[share_columns]
+        df.groupby(
+            "file"
+        )[share_columns]
         .mean()
     )
 
     overall_stage_shares = (
-        per_file_shares.mean()
+        per_file_shares
+        .mean()
     )
 
 
     # --------------------------------------------------------
-    # Stage statistics
+    # GPU stage statistics
     # --------------------------------------------------------
 
-    rng = np.random.default_rng(
-        RANDOM_SEED
+    rng = (
+        np.random.default_rng(
+            RANDOM_SEED
+        )
     )
 
     summary_rows = []
 
-    for stage in stage_columns:
+    for stage in (
+        gpu_stage_columns
+    ):
 
-        values = per_file[
-            stage
-        ].to_numpy(dtype=float)
+        values = (
+            per_file[stage]
+            .to_numpy(
+                dtype=float
+            )
+        )
 
         ci_low, ci_high = (
             bootstrap_median_ci(
@@ -726,10 +1129,16 @@ def main():
         )
 
         summary_rows.append({
-            "stage": stage,
+
+            "stage":
+                stage,
 
             "median_ms":
-                float(np.median(values)),
+                float(
+                    np.median(
+                        values
+                    )
+                ),
 
             "ci95_low_ms":
                 ci_low,
@@ -754,8 +1163,10 @@ def main():
         })
 
 
-    stage_summary = pd.DataFrame(
-        summary_rows
+    stage_summary = (
+        pd.DataFrame(
+            summary_rows
+        )
     )
 
     stage_summary.to_csv(
@@ -765,18 +1176,38 @@ def main():
 
 
     # --------------------------------------------------------
-    # Overall profiled wall latency
+    # Overall GPU compute latency
     # --------------------------------------------------------
 
-    total_values = per_file[
-        "total_profile_wall_ms"
-    ].to_numpy(dtype=float)
+    gpu_values = (
+        per_file[
+            "gpu_compute_wall_ms"
+        ]
+        .to_numpy(
+            dtype=float
+        )
+    )
 
-    total_ci_low, total_ci_high = (
-        bootstrap_median_ci(
-            total_values,
-            rng,
-            BOOTSTRAP_RESAMPLES
+    (
+        gpu_ci_low,
+        gpu_ci_high
+    ) = bootstrap_median_ci(
+        gpu_values,
+        rng,
+        BOOTSTRAP_RESAMPLES
+    )
+
+
+    # --------------------------------------------------------
+    # GPU pipeline latency including waveform H2D
+    # --------------------------------------------------------
+
+    gpu_pipeline_values = (
+        per_file[
+            "gpu_pipeline_wall_ms"
+        ]
+        .to_numpy(
+            dtype=float
         )
     )
 
@@ -787,55 +1218,102 @@ def main():
 
     print("\n")
     print("=" * 80)
-    print("FINAL GPU STAGE-PROFILING SUMMARY")
+    print(
+        "FINAL WHISPER GPU PROFILING SUMMARY"
+    )
     print("=" * 80)
 
     print(
         stage_summary.to_string(
             index=False,
             formatters={
+
                 "median_ms":
-                    lambda x: f"{x:.3f}",
+                    lambda x:
+                    f"{x:.3f}",
 
                 "ci95_low_ms":
-                    lambda x: f"{x:.3f}",
+                    lambda x:
+                    f"{x:.3f}",
 
                 "ci95_high_ms":
-                    lambda x: f"{x:.3f}",
+                    lambda x:
+                    f"{x:.3f}",
 
                 "p95_ms":
-                    lambda x: f"{x:.3f}",
+                    lambda x:
+                    f"{x:.3f}",
 
                 "mean_stage_share_pct":
-                    lambda x: f"{x:.2f}%",
+                    lambda x:
+                    f"{x:.2f}%",
             }
         )
     )
 
-    print("\nOverall profiled wall latency")
+
+    print(
+        "\nGPU compute latency "
+        "(primary profiling metric)"
+    )
+
     print(
         f"Median: "
-        f"{np.median(total_values):.3f} ms"
+        f"{np.median(gpu_values):.3f} ms"
     )
 
     print(
         f"95% bootstrap CI: "
-        f"{total_ci_low:.3f}–"
-        f"{total_ci_high:.3f} ms"
+        f"{gpu_ci_low:.3f}–"
+        f"{gpu_ci_high:.3f} ms"
+    )
+
+
+    print(
+        "\nGPU pipeline latency "
+        "(waveform H2D + GPU compute)"
     )
 
     print(
-        "\nMean stage shares sum to: "
+        f"Median: "
+        f"{np.median(gpu_pipeline_values):.3f} ms"
+    )
+
+
+    print(
+        "\nCPU audio loading "
+        "(reported separately)"
+    )
+
+    print(
+        f"Median: "
+        f"{per_file['load_audio_cpu_ms'].median():.3f} ms"
+    )
+
+
+    print(
+        "\nMean GPU stage shares sum to: "
         f"{stage_summary['mean_stage_share_pct'].sum():.2f}%"
     )
 
-    print("\nSaved:")
-    print(f"  {raw_path}")
-    print(f"  {per_file_path}")
-    print(f"  {stage_summary_path}")
-    print(f"  {metadata_path}")
 
-    print("\nProfiling completed successfully.")
+    print("\nSaved:")
+    print(
+        f"  {raw_path}"
+    )
+    print(
+        f"  {per_file_path}"
+    )
+    print(
+        f"  {stage_summary_path}"
+    )
+    print(
+        f"  {metadata_path}"
+    )
+
+    print(
+        "\nGPU profiling completed successfully."
+    )
 
 
 if __name__ == "__main__":
